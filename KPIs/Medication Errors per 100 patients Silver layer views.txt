@@ -1,0 +1,917 @@
+-------------------------------------------------------------------------------
+-- 1) Unified Admissions (denominator) across HL7 + CCDA + CSV
+-------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_admissions_unified AS
+/* HL7 ADT PV1 + PID */
+SELECT
+  -- Encounter key: HL7 VISIT_NUMBER if present; else PV1 composite
+  COALESCE(pv1.VISIT_NUMBER,
+           MD5(COALESCE(pv1.ASSIGNED_LOCATION_RAW,'') || COALESCE(pid.PATIENT_ID_LIST,''))) AS encounter_key,
+  -- Patient key: hash of HL7 patient_id_list
+  MD5(COALESCE(pid.PATIENT_ID_LIST,'')) AS patient_key,
+  CAST(pv1.ADMIT_DT_TZ     AS TIMESTAMP_NTZ) AS admit_datetime,
+  CAST(pv1.DISCHARGE_DT_TZ AS TIMESTAMP_NTZ) AS discharge_datetime,
+  UPPER(pv1.PATIENT_CLASS)                   AS patient_class,
+  UPPER(pv1.HOSPITAL_SERVICE_DESC)           AS hospital_service,
+  pv1.ASSIGNED_LOCATION_RAW                  AS department_id,
+  pv1.ATTENDING_ID                           AS attending_provider,
+  pv1.REFERRING_ID                           AS referring_provider,
+  pv1.CONSULTING_ID                          AS consulting_provider,
+  'HL7'                                      AS source_system
+FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1 pv1
+LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+  ON pv1.FILENAME = pid.FILENAME
+
+/* CCDA Encounters */
+UNION ALL
+/* CCDA Encounters (parse START_RAW/STOP_RAW -> TIMESTAMP_NTZ) */
+SELECT
+  MD5(COALESCE(e.PATIENT_ID,'') || COALESCE(e.START_RAW,'')) AS encounter_key,
+  MD5(COALESCE(e.PATIENT_ID,''))                             AS patient_key,
+  /* Strip any non-digits (e.g., trailing 'data'), then parse */
+  TRY_TO_TIMESTAMP_NTZ(
+    REGEXP_REPLACE(e.START_RAW, '[^0-9]', ''),
+    'YYYYMMDDHH24MISS'
+  ) AS admit_datetime,
+  TRY_TO_TIMESTAMP_NTZ(
+    REGEXP_REPLACE(e.STOP_RAW, '[^0-9]', ''),
+    'YYYYMMDDHH24MISS'
+  ) AS discharge_datetime,
+  UPPER(e.DESCRIPTION)                                       AS patient_class,      -- CCDA doesn’t carry PV1 class; use description as label
+  UPPER(e.DESCRIPTION)                                       AS hospital_service,
+  NULL                                                       AS department_id,
+  NULL                                                       AS attending_provider,
+  NULL                                                       AS referring_provider,
+  NULL                                                       AS consulting_provider,
+  'CCDA'                                                     AS source_system
+FROM FINAL_ASSIGNMENT.CCDA.CCDA_ENCOUNTERS e
+/* CSV Encounters (optional enrichment) */
+UNION ALL
+SELECT
+  MD5(COALESCE(c.ID,''))                                             AS encounter_key,
+  MD5(COALESCE(c.PATIENT,''))                                        AS patient_key,
+  TRY_TO_TIMESTAMP_NTZ(c."START")                                    AS admit_datetime,     -- from VARCHAR
+  TRY_TO_TIMESTAMP_NTZ(c.STOP)                                       AS discharge_datetime, -- from VARCHAR
+  UPPER(c.ENCOUNTERCLASS)                                            AS patient_class,
+  UPPER(c.DESCRIPTION)                                               AS hospital_service,
+  NULL                                                               AS department_id,
+  c.PROVIDER                                                         AS attending_provider,
+  NULL                                                               AS referring_provider,
+  NULL                                                               AS consulting_provider,
+  'CSV'                                                              AS source_system
+FROM FINAL_ASSIGNMENT.CSV.ENCOUNTERS c;
+
+-- Sources: HL7_BRONZE_PV1 (class/service/providers, admit/discharge), HL7_BRONZE_PID (patient IDs), CCDA_ENCOUNTERS (ISO dates), CSV.ENCOUNTERS (class/desc/provider). [1](https://onlinect-my.sharepoint.com/personal/sanket_bagul_p_citiustech_com/Documents/Microsoft%20Copilot%20Chat%20Files/final%20database.sql)
+USE DATABASE FINAL_ASSIGNMENT;
+--------------------------------------------------------------------------------------------------------
+-- 1) Deduplicate encounter rows (Silver)
+--------------------------------------------------------------------------------------------------------
+-- Keep a single record per ENCOUNTER_KEY (prefer latest discharge; if missing, earliest admit)
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_admissions_dedup AS
+SELECT *
+FROM (
+  SELECT a.*,
+         ROW_NUMBER() OVER (
+           PARTITION BY ENCOUNTER_KEY
+           ORDER BY DISCHARGE_DATETIME DESC NULLS LAST, ADMIT_DATETIME ASC
+         ) AS rn
+  FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_unified a
+)
+WHERE rn = 1;
+
+--------------------------------------------------------------------------------------------------------
+-- 2)Normalize PATIENT_CLASS (Silver)
+--------------------------------------------------------------------------------------------------------
+
+-- Map to a single normalized class set (adds OBSERVATION if present)
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_admissions_normalized AS
+SELECT a.*,
+       CASE
+         WHEN UPPER(a.PATIENT_CLASS) IN ('I','INPATIENT')                    THEN 'INPATIENT'
+         WHEN UPPER(a.PATIENT_CLASS) IN ('E','EMERGENCY')                     THEN 'EMERGENCY'
+         WHEN UPPER(a.PATIENT_CLASS) IN ('O','OUTPATIENT','AMBULATORY','HOME','VIRTUAL') THEN 'OUTPATIENT'
+         WHEN UPPER(a.PATIENT_CLASS) IN ('OBSERVATION')                       THEN 'OBSERVATION'
+         ELSE 'OTHER'
+       END AS ADMISSION_CLASS_NORM
+FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_dedup a;
+--------------------------------------------------------------------------------------------------------
+-- 3) Build enrichment views for Department and Provider
+--------------------------------------------------------------------------------------------------------
+
+    -- 3.1 Department candidates from claims (pick most recent)
+-- Department candidates per patient_key from CLAIMS and CLAIMS_TRANSACTIONS
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_department_candidates AS
+WITH src_claims AS (
+  SELECT
+    MD5(COALESCE(PATIENTID,''))                 AS patient_key,
+    DEPARTMENTID                                AS department_id,
+    TRY_TO_TIMESTAMP_NTZ(SERVICEDATE)           AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.CLAIMS
+  WHERE DEPARTMENTID IS NOT NULL
+),
+src_claims_txn AS (
+  SELECT
+    MD5(COALESCE(PATIENTID,''))                 AS patient_key,
+    DEPARTMENTID                                AS department_id,
+    COALESCE(TRY_TO_TIMESTAMP_NTZ(TODATE),
+             TRY_TO_TIMESTAMP_NTZ(FROMDATE))    AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.CLAIMS_TRANSACTIONS
+  WHERE DEPARTMENTID IS NOT NULL
+),
+unioned AS (
+  SELECT * FROM src_claims
+  UNION ALL
+  SELECT * FROM src_claims_txn
+)
+SELECT patient_key, department_id
+FROM (
+  SELECT patient_key, department_id, activity_dt,
+         ROW_NUMBER() OVER (PARTITION BY patient_key ORDER BY activity_dt DESC NULLS LAST) AS rn
+  FROM unioned
+)
+WHERE rn = 1;
+
+
+-- Provider candidates per patient_key with activity dates
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_provider_candidates AS
+WITH src_claims AS (
+  SELECT
+    MD5(COALESCE(PATIENTID,''))              AS patient_key,
+    PROVIDERID                                AS attending_provider_id,
+    REFERRINGPROVIDERID                       AS referring_provider_id,
+    SUPERVISINGPROVIDERID                     AS consulting_provider_id,
+    TRY_TO_TIMESTAMP_NTZ(SERVICEDATE)        AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.CLAIMS
+),
+src_enc AS (
+  SELECT
+    MD5(COALESCE(PATIENT,''))                AS patient_key,
+    PROVIDER                                 AS attending_provider_id,
+    NULL                                     AS referring_provider_id,
+    NULL                                     AS consulting_provider_id,
+    TRY_TO_TIMESTAMP_NTZ("START")            AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.ENCOUNTERS
+)
+SELECT patient_key,
+       attending_provider_id,
+       referring_provider_id,
+       consulting_provider_id
+FROM (
+  SELECT patient_key,
+         attending_provider_id,
+         referring_provider_id,
+         consulting_provider_id,
+         activity_dt,
+         ROW_NUMBER() OVER (PARTITION BY patient_key ORDER BY activity_dt DESC NULLS LAST) AS rn
+  FROM (
+    SELECT * FROM src_claims
+    UNION ALL
+    SELECT * FROM src_enc
+  )
+)
+WHERE rn = 1;
+
+-- 3.2 Provider candidates from claims & CSV encounters 
+
+-- Provider candidates per patient_key with activity dates
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_provider_candidates AS
+WITH src_claims AS (
+  SELECT
+    MD5(COALESCE(PATIENTID,''))              AS patient_key,
+    PROVIDERID                                AS attending_provider_id,
+    REFERRINGPROVIDERID                       AS referring_provider_id,
+    SUPERVISINGPROVIDERID                     AS consulting_provider_id,
+    TRY_TO_TIMESTAMP_NTZ(SERVICEDATE)        AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.CLAIMS
+),
+src_enc AS (
+  SELECT
+    MD5(COALESCE(PATIENT,''))                AS patient_key,
+    PROVIDER                                 AS attending_provider_id,
+    NULL                                     AS referring_provider_id,
+    NULL                                     AS consulting_provider_id,
+    TRY_TO_TIMESTAMP_NTZ("START")            AS activity_dt
+  FROM FINAL_ASSIGNMENT.CSV.ENCOUNTERS
+)
+SELECT patient_key,
+       attending_provider_id,
+       referring_provider_id,
+       consulting_provider_id
+FROM (
+  SELECT patient_key,
+         attending_provider_id,
+         referring_provider_id,
+         consulting_provider_id,
+         activity_dt,
+         ROW_NUMBER() OVER (PARTITION BY patient_key ORDER BY activity_dt DESC NULLS LAST) AS rn
+  FROM (
+    SELECT * FROM src_claims
+    UNION ALL
+    SELECT * FROM src_enc
+  )
+)
+WHERE rn = 1;
+
+-- Provider display names (ID -> NAME)
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_provider_bridge AS
+SELECT
+  ID   AS provider_id,
+  NAME AS provider_name
+FROM FINAL_ASSIGNMENT.CSV.PROVIDERS;
+
+--------------------------------------------------------------------------------------------------------
+-- 4) Admissions enriched (Silver)
+--------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.vw_admissions_enriched AS
+SELECT
+  a.ENCOUNTER_KEY,
+  a.PATIENT_KEY,
+  a.ADMIT_DATETIME,
+  a.DISCHARGE_DATETIME,
+  a.PATIENT_CLASS,
+  a.HOSPITAL_SERVICE,
+  -- Enriched department (claims fallback)
+  COALESCE(a.DEPARTMENT_ID, d.department_id) AS DEPARTMENT_ID_ENRICHED,
+
+  -- Raw provider IDs as-is (HL7 populated), else enriched from claims/CSV
+  COALESCE(a.ATTENDING_PROVIDER,  pc.attending_provider_id)  AS ATTENDING_PROVIDER_ID_ENRICHED,
+  COALESCE(a.REFERRING_PROVIDER,  pc.referring_provider_id)  AS REFERRING_PROVIDER_ID_ENRICHED,
+  COALESCE(a.CONSULTING_PROVIDER, pc.consulting_provider_id) AS CONSULTING_PROVIDER_ID_ENRICHED,
+
+  -- Display names via provider bridge
+  pb_att.provider_name AS ATTENDING_PROVIDER_NAME_ENRICHED,
+  pb_ref.provider_name AS REFERRING_PROVIDER_NAME_ENRICHED,
+  pb_con.provider_name AS CONSULTING_PROVIDER_NAME_ENRICHED,
+
+  a.SOURCE_SYSTEM,
+  a.ADMISSION_CLASS_NORM
+FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_normalized a
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.vw_department_candidates d
+  ON a.PATIENT_KEY = d.patient_key
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.vw_provider_candidates pc
+  ON a.PATIENT_KEY = pc.patient_key
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.vw_provider_bridge pb_att
+  ON COALESCE(a.ATTENDING_PROVIDER,  pc.attending_provider_id) = pb_att.provider_id
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.vw_provider_bridge pb_ref
+  ON COALESCE(a.REFERRING_PROVIDER,  pc.referring_provider_id) = pb_ref.provider_id
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.vw_provider_bridge pb_con
+  ON COALESCE(a.CONSULTING_PROVIDER, pc.consulting_provider_id) = pb_con.provider_id;
+
+--------------------------------------------------------------------------------------------------------
+-- 5) GOLD denominator view—including OUTPATIENT / AMBULATORY / OBSERVATION
+--------------------------------------------------------------------------------------------------------
+
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.GOLD.vw_admissions_month AS
+SELECT
+  DATE_TRUNC('month', ADMIt_DATETIME) AS month_start,
+  COUNT(DISTINCT ENCOUNTER_KEY)       AS admissions
+FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_enriched
+WHERE ADMISSION_CLASS_NORM IN ('INPATIENT','EMERGENCY','OUTPATIENT','AMBULATORY','OBSERVATION')
+  AND ADMIt_DATETIME IS NOT NULL
+GROUP BY 1;
+
+--------------------------------------------------------------------------------------------------------
+-- 8) Validation steps
+--------------------------------------------------------------------------------------------------------
+-- Check class distribution after normalization
+SELECT ADMISSION_CLASS_NORM, COUNT(*) 
+FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_enriched
+GROUP BY 1 ORDER BY 2 DESC;
+
+-- Enrichment coverage
+SELECT 
+  COUNT_IF(DEPARTMENT_ID_ENRICHED IS NOT NULL) AS dept_filled,
+  COUNT_IF(ATTENDING_PROVIDER_ID_ENRICHED IS NOT NULL) AS attending_filled,
+  COUNT_IF(ATTENDING_PROVIDER_NAME_ENRICHED IS NOT NULL) AS attending_named
+FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_enriched;
+
+-- Monthly denominator now including OUTPATIENT/AMBULATORY/OBSERVATION
+SELECT * FROM FINAL_ASSIGNMENT.GOLD.vw_admissions_month ORDER BY month_start DESC;
+
+
+-------------------------------------------------------------------------------
+-- 2) Diagnoses unified (HL7 DG1 + CCDA PROBLEMS + CSV CONDITIONS)
+-------------------------------------------------------------------------------
+CREATE OR REPLACE VIEW SILVER.silver_vw_diagnoses_unified AS
+
+/* HL7: DG1 — parse timezone offset in DIAGNOSIS_DT_RAW, then choose TZ/LTZ/NTZ */
+WITH hl7_src AS (
+  SELECT
+    MD5(COALESCE(d.PATIENT_ID, ''))        AS PATIENT_KEY,
+    UPPER(COALESCE(d.DIAGNOSIS_CODE, ''))  AS CODE,
+    d.DIAGNOSIS_DESC                       AS DESCRIPTION,
+
+    /* 1) Normalize raw string: "YYYYMMDDHH24MISS+0530" → "YYYYMMDDHH24MISS +0530" */
+    REGEXP_REPLACE(d.DIAGNOSIS_DT_RAW, '([0-9]{14})([+-][0-9]{4})', '\\1 \\2') AS DIAGNOSIS_DT_RAW_SPACED,
+
+    /* 2) Parse as TIMESTAMP_TZ using TZHTZM for "+0530" style offsets */
+    TRY_TO_TIMESTAMP_TZ(
+      REGEXP_REPLACE(d.DIAGNOSIS_DT_RAW, '([0-9]{14})([+-][0-9]{4})', '\\1 \\2'),
+      'YYYYMMDDHH24MISS TZHTZM'
+    ) AS START_DT_TZ
+  FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_DG1 d
+)
+
+SELECT DISTINCT
+  PATIENT_KEY,
+  CODE,
+  DESCRIPTION,
+
+  /* 👉 Option A: keep timezone (recommended for provenance/accuracy) */
+  /* CAST(START_DT_TZ AS TIMESTAMP_TZ) AS START_DT, */
+
+  /* 👉 Option B: normalize to session timezone (LTZ) */
+  /* CAST(START_DT_TZ AS TIMESTAMP_LTZ) AS START_DT, */
+
+  /* 👉 Option C: drop timezone (NTZ, wall-clock) — used in your previous views */
+  CAST(START_DT_TZ AS TIMESTAMP_NTZ) AS START_DT,
+
+  'HL7' AS SOURCE_SYSTEM
+FROM hl7_src
+
+UNION ALL
+
+/* CCDA: already 14-digit digits-only → parse directly */
+SELECT DISTINCT
+  MD5(COALESCE(p.PATIENT_ID, ''))         AS PATIENT_KEY,
+  UPPER(COALESCE(p.CODE, ''))             AS CODE,
+  p.DESCRIPTION                           AS DESCRIPTION,
+  TRY_TO_TIMESTAMP_NTZ(
+    REGEXP_REPLACE(p.START_RAW, '[^0-9]', ''),
+    'YYYYMMDDHH24MISS'
+  )                                        AS START_DT,
+  'CCDA'                                   AS SOURCE_SYSTEM
+FROM FINAL_ASSIGNMENT.CCDA.CCDA_PROBLEMS p
+
+UNION ALL
+
+/* CSV: parse plain strings */
+SELECT DISTINCT
+  MD5(COALESCE(c.PATIENT, ''))            AS PATIENT_KEY,
+  UPPER(COALESCE(c.CODE, ''))             AS CODE,
+  c.DESCRIPTION                           AS DESCRIPTION,
+  TRY_TO_TIMESTAMP_NTZ(c."START")         AS START_DT,
+  'CSV'                                    AS SOURCE_SYSTEM
+FROM FINAL_ASSIGNMENT.CSV.CONDITIONS c;
+
+
+-------------------------------------------------------------------------------
+-- 3) Allergies unified (HL7 AL1 + CCDA ALLERGIES + CSV ALLERGIES)
+-------------------------------------------------------------------------------
+
+USE DATABASE FINAL_ASSIGNMENT;
+USE SCHEMA SILVER;
+
+CREATE OR REPLACE VIEW silver_vw_allergies_unified AS
+WITH
+
+/* =========================
+   HL7 (AL1) — hygiene + TZ parsing
+   ========================= */
+hl7_norm AS (
+  SELECT
+    /* Patient key (anonymized) */
+    MD5(COALESCE(NULLIF(TRIM(a.PATIENT_ID), ''), '')) AS patient_key,
+
+    /* Allergen term with fallbacks + hygiene */
+    LOWER(
+      COALESCE(
+        NULLIF(TRIM(a.ALLERGEN_TEXT), ''),
+        NULLIF(TRIM(a.ALLERGEN_RAW), ''),
+        NULLIF(TRIM(a.ALLERGEN_CODE), '')
+      )
+    ) AS allergen_term,
+
+    /* Severity (no default here; HL7 seems complete) */
+    UPPER(NULLIF(TRIM(a.SEVERITY_DESC), '')) AS severity,
+
+    /* Reaction (prefer first reaction, then list) */
+    NULLIF(TRIM(COALESCE(a.REACTION_FIRST, a.REACTION_LIST)), '') AS reaction_raw,
+
+    /* HL7 timestamp with timezone offset like 20250603084301+0530 → NTZ */
+    CAST(
+      COALESCE(
+        TRY_TO_TIMESTAMP_TZ(
+          REGEXP_REPLACE(a.ID_DT_RAW, '(\\d{14})([+-]\\d{4})', '\\1 \\2'),
+          'YYYYMMDDHH24MISS TZHTZM'
+        ),
+        TRY_TO_TIMESTAMP_TZ(a.ID_DT_RAW, 'YYYYMMDDHH24MISS TZHTZM'),
+        TRY_TO_TIMESTAMP_TZ(
+          REGEXP_REPLACE(a.ID_DT_RAW, '(\\d{14})([+-]\\d{2}:\\d{2})', '\\1 \\2'),
+          'YYYYMMDDHH24MISS TZH:TZM'
+        ),
+        TRY_TO_TIMESTAMP_TZ(a.ID_DT_RAW, 'YYYYMMDDHH24MISS'),
+        TRY_TO_TIMESTAMP_TZ(a.ID_DT_RAW)
+      ) AS TIMESTAMP_NTZ
+    ) AS start_dt,
+
+    'HL7' AS source_system
+  FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_AL1 a
+),
+
+/* =========================
+   CCDA — hygiene + reaction enrichment fallback
+   ========================= */
+ccda_norm AS (
+  SELECT
+    MD5(COALESCE(NULLIF(TRIM(c.PATIENT_ID), ''), '')) AS patient_key,
+
+    LOWER(
+      COALESCE(
+        NULLIF(TRIM(c.SUBSTANCE_DESC), ''),
+        NULLIF(TRIM(c.SUBSTANCE_CODE), '')
+      )
+    ) AS allergen_term,
+
+    UPPER(NULLIF(TRIM(c.SEVERITY), '')) AS severity,
+
+    /* Reaction: enrich if missing (fallback rule) */
+    /* If you have alternate CCDA fields, replace the COALESCE below to include them */
+    COALESCE(
+      NULLIF(TRIM(c.REACTION_DESC), ''),
+      'unspecified reaction'
+    ) AS reaction_raw,
+
+    /* START_RAW can vary; try several formats after stripping non-digits */
+    COALESCE(
+      TRY_TO_TIMESTAMP_NTZ(
+        REGEXP_REPLACE(c.START_RAW, '[^0-9]', ''),
+        'YYYYMMDDHH24MISS'
+      ),
+      TRY_TO_TIMESTAMP_NTZ(
+        REGEXP_REPLACE(c.START_RAW, '[^0-9]', ''),
+        'YYYYMMDD'
+      ),
+      TRY_TO_TIMESTAMP_NTZ(
+        REGEXP_REPLACE(c.START_RAW, '[^0-9]', ''),
+        'YYYYMM'
+      )
+    ) AS start_dt,
+
+    'CCDA' AS source_system
+  FROM FINAL_ASSIGNMENT.CCDA.CCDA_ALLERGIES c
+),
+
+/* =========================
+   CSV — hygiene + severity default UNKNOWN + robust time parsing
+   ========================= */
+csv_norm AS (
+  SELECT
+    MD5(COALESCE(NULLIF(TRIM(s.PATIENT), ''), '')) AS patient_key,
+
+    LOWER(
+      COALESCE(
+        NULLIF(TRIM(s.DESCRIPTION), ''),
+        NULLIF(TRIM(s.CODE), '')
+      )
+    ) AS allergen_term,
+
+    /* Default missing severity to UNKNOWN */
+    UPPER(
+      COALESCE(
+        NULLIF(TRIM(s.SEVERITY1), ''),
+        NULLIF(TRIM(s.SEVERITY2), ''),
+        'UNKNOWN'
+      )
+    ) AS severity,
+
+    COALESCE(
+      NULLIF(TRIM(s.DESCRIPTION1), ''),
+      NULLIF(TRIM(s.DESCRIPTION2), '')
+    ) AS reaction_raw,
+
+    COALESCE(
+      TRY_TO_TIMESTAMP_NTZ(s."START", 'YYYY-MM-DD"T"HH24:MI:SS'),
+      TRY_TO_TIMESTAMP_NTZ(s."START", 'YYYY-MM-DD HH24:MI:SS'),
+      TRY_TO_TIMESTAMP_NTZ(s."START")
+    ) AS start_dt,
+
+    'CSV' AS source_system
+  FROM FINAL_ASSIGNMENT.CSV.ALLERGIES s
+),
+
+/* =========================
+   Final clean: delimiters + synthetic key + load_ts
+   ========================= */
+final_clean AS (
+  SELECT
+    patient_key,
+    /* collapse multiple spaces in term */
+    REGEXP_REPLACE(allergen_term, '\\s+', ' ') AS allergen_term,
+    /* normalize reaction delimiters (pipes → commas) */
+    REGEXP_REPLACE(reaction_raw, '\\|', ',') AS reaction,
+    severity,
+    start_dt,
+    source_system,
+    CURRENT_TIMESTAMP() AS load_ts
+  FROM (
+    SELECT * FROM hl7_norm
+    UNION ALL
+    SELECT * FROM ccda_norm
+    UNION ALL
+    SELECT * FROM csv_norm
+  )
+)
+
+SELECT
+  /* synthetic, stable record identity */
+  MD5(
+    COALESCE(patient_key, '') || '|' ||
+    COALESCE(allergen_term, '') || '|' ||
+    COALESCE(reaction, '') || '|' ||
+    COALESCE(TO_CHAR(start_dt, 'YYYY-MM-DD HH24:MI:SS'), '') || '|' ||
+    COALESCE(source_system, '')
+  ) AS allergy_record_key,
+  patient_key,
+  allergen_term,
+  severity,
+  reaction,
+  start_dt,
+  source_system,
+  load_ts
+FROM final_clean;
+
+
+-------------------------------------------------------------------------------
+-- 4) Medications unified (HL7 ORC/OBR as order proxy + CCDA MEDICATIONS + CSV MEDICATIONS)
+-------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.SILVER_VW_MEDICATIONS_UNIFIED AS
+
+/* =========================
+   HL7: ORC + OBR — clinical time first, then PROCESS_TS; cast TZ→NTZ
+   ========================= */
+SELECT
+  MD5(COALESCE(orct.PATIENT_ID_LIST, '')) AS patient_key,
+
+  UPPER(
+    COALESCE(
+      NULLIF(TRIM(obr.SERVICE_CODE), ''),
+      NULLIF(TRIM(obr.SERVICE_TEXT), '')
+    )
+  ) AS med_code_or_text,
+
+  /* START_DT: prefer ORC.ORDER_DT_TZ, then OBR.OBS_DT_TZ, then raw parses, then PROCESS_TS */
+  COALESCE(
+    CAST(orc.ORDER_DT_TZ AS TIMESTAMP_NTZ),
+    CAST(obr.OBS_DT_TZ   AS TIMESTAMP_NTZ),
+
+    /* ORC raw HL7 datetime [YYYYMMDDHH24MISS(+/-TZ)] */
+    CAST(
+      COALESCE(
+        TRY_TO_TIMESTAMP_TZ(
+          REGEXP_REPLACE(NULLIF(TRIM(orc.ORDER_DT_RAW), ''), '(\\d{14})([+-]\\d{4})', '\\1 \\2'),
+          'YYYYMMDDHH24MISS TZHTZM'
+        ),
+        TRY_TO_TIMESTAMP_TZ(NULLIF(TRIM(orc.ORDER_DT_RAW), ''), 'YYYYMMDDHH24MISS'),
+        TRY_TO_TIMESTAMP_TZ(NULLIF(TRIM(orc.ORDER_DT_RAW), ''))
+      ) AS TIMESTAMP_NTZ
+    ),
+
+    /* OBR raw HL7 datetime */
+    CAST(
+      COALESCE(
+        TRY_TO_TIMESTAMP_TZ(
+          REGEXP_REPLACE(NULLIF(TRIM(obr.OBS_DT_RAW), ''), '(\\d{14})([+-]\\d{4})', '\\1 \\2'),
+          'YYYYMMDDHH24MISS TZHTZM'
+        ),
+        TRY_TO_TIMESTAMP_TZ(NULLIF(TRIM(obr.OBS_DT_RAW), ''), 'YYYYMMDDHH24MISS'),
+        TRY_TO_TIMESTAMP_TZ(NULLIF(TRIM(obr.OBS_DT_RAW), ''))
+      ) AS TIMESTAMP_NTZ
+    ),
+
+    /* Last‑resort pipeline time */
+    CAST(orc.PROCESS_TS AS TIMESTAMP_NTZ),
+    CAST(obr.PROCESS_TS AS TIMESTAMP_NTZ)
+  ) AS start_dt,
+
+  /* START provenance label */
+  CASE
+    WHEN orc.ORDER_DT_TZ IS NOT NULL THEN 'ORC.ORDER_DT_TZ'
+    WHEN obr.OBS_DT_TZ  IS NOT NULL THEN 'OBR.OBS_DT_TZ'
+    WHEN orc.ORDER_DT_RAW IS NOT NULL THEN 'ORC.ORDER_DT_RAW_PARSED'
+    WHEN obr.OBS_DT_RAW  IS NOT NULL THEN 'OBR.OBS_DT_RAW_PARSED'
+    WHEN orc.PROCESS_TS  IS NOT NULL THEN 'ORC.PROCESS_TS'
+    WHEN obr.PROCESS_TS  IS NOT NULL THEN 'OBR.PROCESS_TS'
+    ELSE 'UNKNOWN'
+  END AS start_ts_source,
+
+  /* STOP_DT: often missing; use OBR clinical/parsed if available, else PROCESS_TS */
+  COALESCE(
+    CAST(obr.OBS_DT_TZ AS TIMESTAMP_NTZ),
+    CAST(
+      COALESCE(
+        TRY_TO_TIMESTAMP_TZ(
+          REGEXP_REPLACE(NULLIF(TRIM(obr.OBS_DT_RAW), ''), '(\\d{14})([+-]\\d{4})', '\\1 \\2'),
+          'YYYYMMDDHH24MISS TZHTZM'
+        ),
+        TRY_TO_TIMESTAMP_TZ(NULLIF(TRIM(obr.OBS_DT_RAW), ''), 'YYYYMMDDHH24MISS')
+      ) AS TIMESTAMP_NTZ
+    ),
+    CAST(obr.PROCESS_TS AS TIMESTAMP_NTZ),
+    NULL::TIMESTAMP_NTZ
+  ) AS stop_dt,
+
+  /* STOP provenance label */
+  CASE
+    WHEN obr.OBS_DT_TZ  IS NOT NULL THEN 'OBR.OBS_DT_TZ'
+    WHEN obr.OBS_DT_RAW IS NOT NULL THEN 'OBR.OBS_DT_RAW_PARSED'
+    WHEN obr.PROCESS_TS IS NOT NULL THEN 'OBR.PROCESS_TS'
+    ELSE 'NULL'
+  END AS stop_ts_source,
+
+  orc.ORDERING_PROVIDER_ID AS prescriber_id,
+  'HL7' AS source_system
+
+FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_ORC orc
+LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_OBR obr
+  ON orc.PLACER_ORDER_NUM = obr.PLACER_ORDER_NUM
+LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID orct
+  ON orc.FILENAME = orct.FILENAME
+
+
+UNION ALL
+
+/* =========================
+   CCDA: parse RAW dates → NTZ; prefer CODE then DESCRIPTION; add provenance
+   ========================= */
+SELECT
+  MD5(COALESCE(NULLIF(TRIM(m.PATIENT_ID), ''), ''))      AS patient_key,
+  UPPER(COALESCE(NULLIF(TRIM(m.CODE), ''), NULLIF(TRIM(m.DESCRIPTION), ''))) AS med_code_or_text,
+
+  COALESCE(
+    TRY_TO_TIMESTAMP_NTZ(
+      REGEXP_REPLACE(NULLIF(TRIM(m.START_RAW), ''), '[^0-9]', ''),
+      'YYYYMMDDHH24MISS'
+    ),
+    TRY_TO_TIMESTAMP_NTZ(
+      REGEXP_REPLACE(NULLIF(TRIM(m.START_RAW), ''), '[^0-9]', ''),
+      'YYYYMMDD'
+    ),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(m.START_RAW), ''))
+  )                                                      AS start_dt,
+
+  /* START provenance */
+  IFF(
+    NULLIF(TRIM(m.START_RAW), '') IS NOT NULL,
+    'CCDA.START_RAW_PARSED',
+    'NULL'
+  )                                                      AS start_ts_source,
+
+  COALESCE(
+    TRY_TO_TIMESTAMP_NTZ(
+      REGEXP_REPLACE(NULLIF(TRIM(m.STOP_RAW), ''), '[^0-9]', ''),
+      'YYYYMMDDHH24MISS'
+    ),
+    TRY_TO_TIMESTAMP_NTZ(
+      REGEXP_REPLACE(NULLIF(TRIM(m.STOP_RAW), ''), '[^0-9]', ''),
+      'YYYYMMDD'
+    ),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(m.STOP_RAW), ''))
+  )                                                      AS stop_dt,
+
+  /* STOP provenance */
+  IFF(
+    NULLIF(TRIM(m.STOP_RAW), '') IS NOT NULL,
+    'CCDA.STOP_RAW_PARSED',
+    'NULL'
+  )                                                      AS stop_ts_source,
+
+  NULL::VARCHAR                                          AS prescriber_id,
+  'CCDA'                                                 AS source_system
+FROM FINAL_ASSIGNMENT.CCDA.CCDA_MEDICATIONS m
+
+
+UNION ALL
+
+/* =========================
+   CSV: robust parsing for START/STOP strings + provenance
+   ========================= */
+SELECT
+  MD5(COALESCE(NULLIF(TRIM(cm.PATIENT), ''), ''))        AS patient_key,
+  UPPER(COALESCE(NULLIF(TRIM(cm.CODE), ''), NULLIF(TRIM(cm.DESCRIPTION), ''))) AS med_code_or_text,
+
+  /* START with multiple format attempts (fractional seconds, ISO T, plain) */
+  COALESCE(
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm."START"), ''), 'YYYY-MM-DD HH24:MI:SS.FF3'),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm."START"), ''), 'YYYY-MM-DD HH24:MI:SS'),
+    TRY_TO_TIMESTAMP_NTZ(REPLACE(NULLIF(TRIM(cm."START"), ''), 'T', ' '), 'YYYY-MM-DD HH24:MI:SS.FF3'),
+    TRY_TO_TIMESTAMP_NTZ(REPLACE(NULLIF(TRIM(cm."START"), ''), 'T', ' '), 'YYYY-MM-DD HH24:MI:SS'),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm."START"), ''))
+  )                                                      AS start_dt,
+
+  IFF(
+    NULLIF(TRIM(cm."START"), '') IS NOT NULL,
+    'CSV.START_PARSED',
+    'NULL'
+  )                                                      AS start_ts_source,
+
+  COALESCE(
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm.STOP), ''), 'YYYY-MM-DD HH24:MI:SS.FF3'),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm.STOP), ''), 'YYYY-MM-DD HH24:MI:SS'),
+    TRY_TO_TIMESTAMP_NTZ(REPLACE(NULLIF(TRIM(cm.STOP), ''), 'T', ' '), 'YYYY-MM-DD HH24:MI:SS.FF3'),
+    TRY_TO_TIMESTAMP_NTZ(REPLACE(NULLIF(TRIM(cm.STOP), ''), 'T', ' '), 'YYYY-MM-DD HH24:MI:SS'),
+    TRY_TO_TIMESTAMP_NTZ(NULLIF(TRIM(cm.STOP), ''))
+  )                                                      AS stop_dt,
+
+  IFF(
+    NULLIF(TRIM(cm.STOP), '') IS NOT NULL,
+    'CSV.STOP_PARSED',
+    'NULL'
+  )                                                      AS stop_ts_source,
+
+  NULL::VARCHAR                                          AS prescriber_id,
+  'CSV'                                                  AS source_system
+FROM FINAL_ASSIGNMENT.CSV.MEDICATIONS cm;
+
+
+
+-------------------------------------------------------------------------------
+-- 5) Results unified (HL7 OBX + CCDA RESULTS + CSV OBSERVATIONS)
+-------------------------------------------------------------------------------
+
+
+CREATE OR REPLACE VIEW FINAL_ASSIGNMENT.SILVER.SILVER_vw_results_unified AS
+
+/* HL7: OBX – cast TZ → NTZ; join PID for patient_key */
+SELECT
+  MD5(COALESCE(p.PATIENT_ID_LIST, ''))                                   AS patient_key,
+  UPPER(COALESCE(o.OBSERVATION_CODE, o.OBSERVATION_TEXT))                AS obs_code_or_text,
+  NULLIF(TRIM(o.OBSERVATION_VALUE), '')                                  AS obs_value,           -- FIXED: value
+  o.UNITS_RAW                                                            AS units,               -- FIXED: units
+  CAST(o.OBSERVATION_RESULT_DT_TZ AS TIMESTAMP_NTZ)                      AS obs_dt,
+  'HL7'                                                                  AS source_system
+FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_OBX o
+LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID p
+       ON o.FILENAME = p.FILENAME
+
+UNION ALL
+
+/* CCDA: clean START_RAW → NTZ; prefer CODE then DESCRIPTION */
+SELECT
+  MD5(COALESCE(r.PATIENT_ID, ''))                                        AS patient_key,
+  UPPER(COALESCE(r.CODE, r.DESCRIPTION))                                 AS obs_code_or_text,
+  NULLIF(TRIM(r.VALUE), '')                                              AS obs_value,
+  r.UNIT                                                                 AS units,
+  TRY_TO_TIMESTAMP_NTZ(
+    REGEXP_REPLACE(r.START_RAW, '[^0-9]', ''),
+    'YYYYMMDDHH24MISS'
+  )                                                                      AS obs_dt,
+  'CCDA'                                                                 AS source_system
+FROM FINAL_ASSIGNMENT.CCDA.CCDA_RESULTS r
+
+UNION ALL
+
+/* CSV: OBSERVATIONS – parse DATE string, align types */
+SELECT
+  MD5(COALESCE(cv.PATIENT, ''))                                          AS patient_key,
+  UPPER(COALESCE(cv.CODE, cv.DESCRIPTION))                               AS obs_code_or_text,
+
+  /* single obs_value VARCHAR: numeric → string else cleaned text */
+  COALESCE(
+    TO_VARCHAR(TRY_TO_DOUBLE(cv.VALUE)),
+    NULLIF(TRIM(cv.VALUE), '')
+  )                                                                      AS obs_value,
+
+  /* units only for numeric; else nominal (or NULL if you prefer) */
+  CASE
+    WHEN TRY_TO_DOUBLE(cv.VALUE) IS NOT NULL THEN cv.UNITS
+    ELSE '{nominal}'
+  END                                                                    AS units,
+
+  TRY_TO_TIMESTAMP_NTZ(cv.DATE)                                          AS obs_dt,
+  'CSV'                                                                  AS source_system
+FROM FINAL_ASSIGNMENT.CSV.OBSERVATIONS cv;
+
+
+-------------------------------------------------------------------------------
+-- 6) Build the single SILVER table for KPI (one row per encounter)
+-------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------
+-- KPI_COMMON_ENCOUNTER as a Dynamic Table
+-- Maintained incrementally by Snowflake
+-------------------------------------------------------------------------------
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.SILVER.SILVER_1000_PATIENTS_KPI_COMMON_ENCOUNTER
+TARGET_LAG = '5 MINUTES'               -- freshness target (SLA)
+WAREHOUSE  = COMPUTE_WH                 -- the warehouse used for refresh
+AS
+
+-- Denominator: encounter-level rows from the enriched admissions view
+WITH e AS (
+  SELECT
+    a.ENCOUNTER_KEY,
+    a.PATIENT_KEY,
+    a.ADMIT_DATETIME,
+    a.DISCHARGE_DATETIME,
+    a.ADMISSION_CLASS_NORM      AS patient_class,
+    a.HOSPITAL_SERVICE,
+    a.DEPARTMENT_ID_ENRICHED    AS department_id,
+    a.ATTENDING_PROVIDER_NAME_ENRICHED   AS attending_provider,
+    a.REFERRING_PROVIDER_NAME_ENRICHED   AS referring_provider,
+    a.CONSULTING_PROVIDER_NAME_ENRICHED  AS consulting_provider
+  FROM FINAL_ASSIGNMENT.SILVER.vw_admissions_enriched a
+  WHERE a.ADMISSION_CLASS_NORM IN ('INPATIENT','EMERGENCY')  -- add 'OBSERVATION' if required
+),
+
+-- Diagnoses aggregated per patient
+dx AS (
+  SELECT
+    d.PATIENT_KEY,
+    LISTAGG(COALESCE(d.CODE, d.DESCRIPTION), ', ')
+      WITHIN GROUP (ORDER BY d.START_DT) AS diagnosis_codes,
+    COUNT(*) AS diagnosis_count
+  FROM FINAL_ASSIGNMENT.SILVER.silver_vw_diagnoses_unified d
+  GROUP BY d.PATIENT_KEY
+),
+
+-- Allergies aggregated per patient
+al AS (
+  SELECT
+    a.PATIENT_KEY,
+    LISTAGG(a.ALLERGEN_TERM, ', ')
+      WITHIN GROUP (ORDER BY a.START_DT) AS allergy_terms,
+    LISTAGG(COALESCE(a.REACTION, 'unknown'), ', ')
+      WITHIN GROUP (ORDER BY a.START_DT) AS reactions,
+    MAX(a.SEVERITY) AS top_severity,
+    COUNT(*) AS allergy_count
+  FROM FINAL_ASSIGNMENT.SILVER.silver_vw_allergies_unified a
+  GROUP BY a.PATIENT_KEY
+),
+
+-- Medications aggregated per patient
+med AS (
+  SELECT
+    m.PATIENT_KEY,
+    LISTAGG(m.MED_CODE_OR_TEXT, ', ')
+      WITHIN GROUP (ORDER BY m.START_DT) AS medication_terms,
+    COUNT(*) AS med_count
+  FROM FINAL_ASSIGNMENT.SILVER.SILVER_VW_MEDICATIONS_UNIFIED m
+  GROUP BY m.PATIENT_KEY
+),
+
+-- Results KPIs (basic: last result timestamp + count of rows)
+res_basic AS (
+  SELECT
+    r.PATIENT_KEY,
+    MAX(r.OBS_DT) AS last_result_dt,
+    COUNT(*)      AS result_row_count
+  FROM FINAL_ASSIGNMENT.SILVER.SILVER_vw_results_unified r
+  GROUP BY r.PATIENT_KEY
+)
+
+SELECT
+  e.ENCOUNTER_KEY,
+  e.PATIENT_KEY,
+  e.ADMIT_DATETIME,
+  e.DISCHARGE_DATETIME,
+  e.PATIENT_CLASS,
+  e.HOSPITAL_SERVICE,
+  e.DEPARTMENT_ID,
+  e.ATTENDING_PROVIDER,
+  e.REFERRING_PROVIDER,
+  e.CONSULTING_PROVIDER,
+
+  -- derived aggregates
+  dx.DIAGNOSIS_CODES,
+  dx.DIAGNOSIS_COUNT,
+  al.ALLERGY_TERMS,
+  al.REACTIONS,
+  al.TOP_SEVERITY,
+  al.ALLERGY_COUNT,
+  med.MEDICATION_TERMS,
+  med.MED_COUNT,
+
+  -- results KPIs (basic)
+  res_basic.result_row_count,
+  res_basic.last_result_dt,
+
+  'SILVER_UNIFIED' AS record_source
+FROM e
+LEFT JOIN dx        ON e.PATIENT_KEY = dx.PATIENT_KEY
+LEFT JOIN al        ON e.PATIENT_KEY = al.PATIENT_KEY
+LEFT JOIN med       ON e.PATIENT_KEY = med.PATIENT_KEY
+LEFT JOIN res_basic ON e.PATIENT_KEY = res_basic.PATIENT_KEY;
+
+
+SELECT * FROM FINAL_ASSIGNMENT.SILVER.SILVER_1000_PATIENTS_KPI_COMMON_ENCOUNTER;
+
+
+-- Force a refresh now (e.g., after large upstream load)
+ALTER DYNAMIC TABLE FINAL_ASSIGNMENT.SILVER.KPI_COMMON_ENCOUNTER REFRESH;
+
+-- See dynamic tables in your account/database/schema
+SHOW DYNAMIC TABLES LIKE 'KPI_COMMON_ENCOUNTER';
+
+-- Basic health / refresh history
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_REFRESH_HISTORY())
+WHERE name = 'FINAL_ASSIGNMENT.SILVER.KPI_COMMON_ENCOUNTER'
+ORDER BY start_time DESC;
+
+-- Current lag vs target
+SELECT *
+FROM TABLE(INFORMATION_SCHEMA.DYNAMIC_TABLE_GRAPH())  -- dependency graph
+WHERE target_name = 'FINAL_ASSIGNMENT.SILVER.KPI_COMMON_ENCOUNTER';

@@ -1,0 +1,338 @@
+
+-- CREATE OR REPLACE SCHEMA FINAL_ASSIGNMENT.GOLD;
+
+-- Numerator (Dynamic Table): monthly medication error events
+
+
+USE DATABASE FINAL_ASSIGNMENT;
+CREATE SCHEMA IF NOT EXISTS FINAL_ASSIGNMENT.GOLD;
+
+
+CREATE OR REPLACE TABLE FINAL_ASSIGNMENT.GOLD.LKP_DRUG_CONTRAINDICATION (
+  DRUG_TEXT_OR_CODE   STRING,   -- e.g., 'WARFARIN', 'WARF5', NDC, RxNorm, etc.
+  CONTRA_DX_CODE      STRING,   -- e.g., ICD-10/ICD-9/SNOMED code
+  RULE_ID             STRING,   -- e.g., 'CONTRA_RULE_001'
+  RULE_DESC           STRING    -- human-readable description of the rule
+);
+
+
+-- INSERT INTO FINAL_ASSIGNMENT.GOLD.LKP_DRUG_CONTRAINDICATION
+--   (DRUG_TEXT_OR_CODE, CONTRA_DX_CODE, RULE_ID, RULE_DESC)
+-- VALUES
+--   ('WARFARIN', 'I61', 'CONTRA_RULE_001', 'Warfarin contraindicated in intracerebral hemorrhage'),
+--   ('NSAID',    'K25', 'CONTRA_RULE_002', 'NSAID caution/contraindication with gastric ulcer');
+
+
+-- 2) Seed a few high-frequency code pairs (EDIT these as needed)
+INSERT INTO FINAL_ASSIGNMENT.GOLD.LKP_DRUG_CONTRAINDICATION
+  (DRUG_TEXT_OR_CODE, CONTRA_DX_CODE, RULE_ID, RULE_DESC)
+VALUES
+  ('314076',  '314529007', 'CONTRA_RULE_001', 'Med 314076 contraindicated with Dx 314529007'),
+  ('106892',  '73595000',  'CONTRA_RULE_002', 'Med 106892 contraindicated with Dx 73595000'),
+  ('310798',  '160903007', 'CONTRA_RULE_003', 'Med 310798 contraindicated with Dx 160903007');
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+/* Incident detection rules as a DT */
+WITH
+/* Normalize medications once (so we have MED_TERM ready) */
+meds AS (
+  SELECT
+    patient_key,
+    UPPER(med_code_or_text) AS med_term,
+    med_code_or_text,                -- keep original too, if needed for joins
+    start_dt
+  FROM FINAL_ASSIGNMENT.SILVER.SILVER_VW_MEDICATIONS_UNIFIED
+),
+alls AS (
+  SELECT
+    patient_key,
+    LOWER(allergen_term) AS allergen,
+    reaction,
+    severity,
+    start_dt
+  FROM FINAL_ASSIGNMENT.SILVER.silver_vw_allergies_unified
+),
+
+/* 1) Drug–Allergy conflict: medication term contains allergen term */
+drug_allergy AS (
+  SELECT
+    MD5(
+      COALESCE(m.patient_key,'') || COALESCE(m.med_term,'') ||
+      COALESCE(a.allergen,'')    || COALESCE(a.reaction,'') ||
+      COALESCE(a.severity,'')
+    )                                               AS error_id,
+    NULL::STRING                                    AS encounter_key,
+    m.patient_key,
+    CAST(m.start_dt AS TIMESTAMP_NTZ)               AS incident_datetime,
+    'MEDICATION'                                    AS error_type,
+    'DRUG_ALLERGY_CONFLICT'                         AS error_rule_code,
+    a.severity,
+    a.reaction,
+    NULL::STRING                                    AS ordering_provider_id,
+    NULL::STRING                                    AS condition_code,
+    'UNIFIED'                                       AS source_system
+  FROM meds m
+  JOIN alls a
+    ON m.patient_key = a.patient_key
+   AND m.med_term LIKE '%' || UPPER(a.allergen) || '%'
+),
+
+/* 2) Order cancellation (HL7 OBR status = 'X') */
+order_cancel AS (
+  SELECT
+    MD5(COALESCE(obr.PLACER_ORDER_NUM,'') || 'CANCELLED') AS error_id,
+    NULL::STRING                                          AS encounter_key,
+    MD5(COALESCE(pid.PATIENT_ID_LIST,''))                 AS patient_key,
+    CAST(COALESCE(obr.OBS_DT_TZ, orc.ORDER_DT_TZ) AS TIMESTAMP_NTZ) AS incident_datetime,
+    'PROCEDURE'                                           AS error_type,
+    'ORDER_CANCELLED'                                     AS error_rule_code,
+    NULL                                                  AS severity,
+    NULL                                                  AS reaction,
+    orc.ORDERING_PROVIDER_ID                              AS ordering_provider_id,
+    NULL                                                  AS condition_code,
+    'HL7'                                                 AS source_system
+  FROM FINAL_ASSIGNMENT.HL7.HL7_BRONZE_OBR obr
+  LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_ORC orc
+    ON obr.PLACER_ORDER_NUM = orc.PLACER_ORDER_NUM
+  LEFT JOIN FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+    ON obr.FILENAME = pid.FILENAME
+  WHERE UPPER(COALESCE(obr.OBR_STATUS_RAW,'')) = 'X'
+),
+
+/* 3) Contraindication (lookup-driven DX vs drug) */
+contra AS (
+  SELECT
+    MD5(
+      COALESCE(m.patient_key,'') || COALESCE(m.med_term,'') ||
+      COALESCE(l.CONTRA_DX_CODE,'') || 'CONTRA'
+    )                                              AS error_id,
+    NULL::STRING                                   AS encounter_key,
+    m.patient_key,
+    CAST(m.start_dt AS TIMESTAMP_NTZ)              AS incident_datetime,
+    'MEDICATION'                                   AS error_type,
+    l.RULE_ID                                      AS error_rule_code,
+    NULL                                           AS severity,
+    NULL                                           AS reaction,
+    NULL                                           AS ordering_provider_id,
+    d.CODE                                         AS condition_code,  -- corrected column name
+    'UNIFIED'                                      AS source_system
+  FROM meds m
+  JOIN FINAL_ASSIGNMENT.GOLD.LKP_DRUG_CONTRAINDICATION l
+    ON ( m.med_code_or_text = l.DRUG_TEXT_OR_CODE
+         OR m.med_code_or_text LIKE '%' || l.DRUG_TEXT_OR_CODE || '%' )
+  JOIN FINAL_ASSIGNMENT.SILVER.silver_vw_diagnoses_unified d
+    ON m.patient_key = d.PATIENT_KEY
+   AND UPPER(d.CODE) = UPPER(l.CONTRA_DX_CODE)
+)
+
+SELECT * FROM drug_allergy
+UNION ALL
+SELECT * FROM order_cancel
+UNION ALL
+SELECT * FROM contra;
+
+
+
+-- GOLD: dedup by ERROR_ID (keep latest by incident_datetime)
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DEDUP_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT *
+FROM (
+  SELECT e.*,
+         ROW_NUMBER() OVER (PARTITION BY e.ERROR_ID
+                            ORDER BY e.INCIDENT_DATETIME DESC) AS rn
+  FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DT e
+)
+QUALIFY rn = 1;
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_MED_ERRORS_MONTH_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  DATE_TRUNC('month', INCIDENT_DATETIME) AS MONTH_START,
+  COUNT(*)                               AS MED_ERROR_EVENTS
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DEDUP_DT
+GROUP BY 1;
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MED_ERROR_W_ENC_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT e.ERROR_ID,
+       COALESCE(e.ENCOUNTER_KEY, u.ENCOUNTER_KEY) AS ENCOUNTER_KEY,
+       e.PATIENT_KEY,
+       e.INCIDENT_DATETIME,
+       e.ERROR_TYPE,
+       e.ERROR_RULE_CODE,
+       e.SEVERITY,
+       e.REACTION,
+       e.ORDERING_PROVIDER_ID,
+       e.CONDITION_CODE,
+       e.SOURCE_SYSTEM
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DEDUP_DT e
+LEFT JOIN FINAL_ASSIGNMENT.SILVER.SILVER_UNIFIED_COMMON_ENCOUNTER_TBL u
+       ON e.PATIENT_KEY = u.PATIENT_KEY
+      AND e.INCIDENT_DATETIME BETWEEN DATEADD('hour', -48, u.ADMIT_DATETIME)
+                                  AND DATEADD('hour',  48, COALESCE(u.DISCHARGE_DATETIME, u.ADMIT_DATETIME));
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_FILTERED_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT *
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DEDUP_DT
+WHERE INCIDENT_DATETIME >= '2008-01-01'     -- choose your baseline year
+  AND INCIDENT_DATETIME <= CURRENT_TIMESTAMP();  -- no future rows
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_ENRICHED_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  e.ERROR_ID,
+  e.ENCOUNTER_KEY,
+  e.PATIENT_KEY,
+  e.INCIDENT_DATETIME,
+  e.ERROR_TYPE,
+  e.ERROR_RULE_CODE,
+  COALESCE(e.SEVERITY, 'UNKNOWN')                AS SEVERITY,
+  COALESCE(e.REACTION, 'UNKNOWN')                AS REACTION,
+  COALESCE(e.ORDERING_PROVIDER_ID, 'UNKNOWN')    AS ORDERING_PROVIDER_ID,
+  e.CONDITION_CODE,
+  e.SOURCE_SYSTEM
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MED_ERROR_W_ENC_DT e;
+
+
+
+SELECT * FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_ENRICHED_DT;
+
+
+-- 1) Ensure dedup worked (ERROR_ID uniqueness)
+SELECT COUNT(*) AS COUNT, COUNT(DISTINCT ERROR_ID) AS distinct_error_ids
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_DEDUP_DT;
+
+-- 2) Check encounter linkage coverage
+SELECT
+  COUNT(*) AS COUNT,
+  COUNT_IF(ENCOUNTER_KEY IS NULL) AS enc_null,
+  COUNT_IF(ENCOUNTER_KEY IS NOT NULL) AS enc_present
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MED_ERROR_W_ENC_DT;
+
+-- 3) Confirm no future dates and bounded horizon
+SELECT MIN(INCIDENT_DATETIME) AS min_dt, MAX(INCIDENT_DATETIME) AS max_dt
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_FILTERED_DT;
+
+-- 4) Monthly numerator (sanity) after dedup/filters
+SELECT MONTH_START, MED_ERROR_EVENTS
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_MED_ERRORS_MONTH_DT
+ORDER BY MONTH_START DESC
+LIMIT 12;
+
+-- 5) Clinical context fill rates
+SELECT
+  COUNT_IF(SEVERITY = 'UNKNOWN') AS sev_unknown,
+  COUNT_IF(REACTION = 'UNKNOWN') AS reaction_unknown,
+  COUNT_IF(ORDERING_PROVIDER_ID = 'UNKNOWN') AS provider_unknown
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_ENRICHED_DT;
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_MEMBERS_MONTH_PROXY_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  DATE_TRUNC('month', ADMIT_DATETIME) AS MONTH_START,
+  COUNT(DISTINCT PATIENT_KEY)         AS MEMBERS_PROXY
+FROM FINAL_ASSIGNMENT.SILVER.SILVER_UNIFIED_COMMON_ENCOUNTER_TBL
+WHERE ADMIT_DATETIME IS NOT NULL
+GROUP BY 1;
+
+
+-- Monthly Numerator (Dynamic Table)
+-- Aggregate monthly error events from the enriched fact DT:
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_MED_ERRORS_MONTH_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  DATE_TRUNC('month', INCIDENT_DATETIME) AS MONTH_START,
+  COUNT(*)                               AS MED_ERROR_EVENTS
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_ENRICHED_DT
+GROUP BY 1;
+
+select * from  FINAL_ASSIGNMENT.GOLD.GOLD_MED_ERRORS_MONTH_DT;
+
+-- 2) KPI (Dynamic Table): Errors per 1000 Members
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_KPI_MED_ERRORS_RATE_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  e.MONTH_START,
+  e.MED_ERROR_EVENTS,
+  m.MEMBERS_PROXY AS MEMBERS,
+  CASE WHEN m.MEMBERS_PROXY > 0
+       THEN (e.MED_ERROR_EVENTS::FLOAT / m.MEMBERS_PROXY) * 1000
+       ELSE 0 END AS MED_ERRORS_PER_1000
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_MED_ERRORS_MONTH_DT e
+LEFT JOIN FINAL_ASSIGNMENT.GOLD.GOLD_MEMBERS_MONTH_PROXY_DT m
+       ON e.MONTH_START = m.MONTH_START;
+
+-- Per‑Encounter KPI
+-- Because your enriched fact includes (or can include) ENCOUNTER_KEY, you can also serve the “errors per 1000 encounters” KPI:
+-- A) Monthly admissions (encounter count) from the Silver unified table
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_ADMISSIONS_MONTH_DT
+TARGET_LAG = '15 MINUTES'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  DATE_TRUNC('month', ADMIT_DATETIME) AS MONTH_START,
+  COUNT(DISTINCT ENCOUNTER_KEY)       AS ADMISSIONS
+FROM FINAL_ASSIGNMENT.SILVER.SILVER_UNIFIED_COMMON_ENCOUNTER_TBL
+WHERE ADMIT_DATETIME IS NOT NULL
+GROUP BY 1;
+
+
+select * from FINAL_ASSIGNMENT.GOLD.GOLD_ADMISSIONS_MONTH_DT
+
+-- B) KPI DT: errors per 1000 encounters
+
+
+
+CREATE OR REPLACE DYNAMIC TABLE FINAL_ASSIGNMENT.GOLD.GOLD_KPI_MED_ERRORS_PER_1000_ENCOUNTERS_DT
+TARGET_LAG = '30 DAYS'
+WAREHOUSE  = COMPUTE_WH
+AS
+SELECT
+  DATE_TRUNC('month', f.INCIDENT_DATETIME) AS MONTH_START,
+  COUNT(*)                                 AS MED_ERROR_EVENTS,
+  a.ADMISSIONS                             AS ENCOUNTERS,
+  CASE
+    WHEN a.ADMISSIONS > 0
+      THEN (COUNT(*)::FLOAT / a.ADMISSIONS) * 1000
+      ELSE 0
+  END                                      AS MED_ERRORS_PER_1000_ENCOUNTERS
+FROM FINAL_ASSIGNMENT.GOLD.GOLD_FACT_MEDICAL_ERROR_ENRICHED_DT f
+LEFT JOIN FINAL_ASSIGNMENT.GOLD.GOLD_ADMISSIONS_MONTH_DT a
+  ON DATE_TRUNC('month', f.INCIDENT_DATETIME) = a.MONTH_START
+GROUP BY
+  DATE_TRUNC('month', f.INCIDENT_DATETIME),  -- <- explicit expression, not alias
+  a.ADMISSIONS;
+
+
+SELECT * FROM FINAL_ASSIGNMENT.GOLD.GOLD_KPI_MED_ERRORS_PER_1000_ENCOUNTERS_DT;

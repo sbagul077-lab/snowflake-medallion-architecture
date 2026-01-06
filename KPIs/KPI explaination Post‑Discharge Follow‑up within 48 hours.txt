@@ -1,0 +1,14 @@
+Post‑Discharge Follow‑up within 48 hours
+Intent: Track how consistently care teams contact members promptly after discharge, because timely follow‑ups reduce downstream adverse events and readmissions. (Business context; no external sources needed.)
+Precise definition (from your KPI repository):
+
+“Count the number of records with a discharge notification date in the month that also have a contact type of Post‑Discharge Follow‑up (PDF) within two business days of the discharge notification (not discharge date) and not re‑admitted to an Inpatient or SNF within two business days of the discharge notification for members in the selected ops team and program who are Managed on the last day of the month, divided by the number of records with a discharge notification date and not re‑admitted within the two business days for those Managed members.” [KPI Master...Repository | Excel]
+
+
+Your Snowflake script expresses the same requirement with a 48‑hour window (and computes a readmission exclusion over ≤48 hours), using discharge notifications (HL7 EVN A03 or CCDA Discharge Instructions) as the trigger rather than the raw discharge timestamp. [KPI Post‑D...n 48 hours | Txt]
+
+Key nuances to keep consistent:
+
+Use discharge notification time, not discharge time. [KPI Master...Repository | Excel], [KPI Post‑D...n 48 hours | Txt]
+Window definition: If your stakeholders want “two business days,” add a business‑day calendar; your current Snowflake logic uses 48 clock‑hours (which is simpler to operationalize). [KPI Post‑D...n 48 hours | Txt]
+Exclusions: Encounters readmitted to Inpatient or SNF within the window are excluded from the denominator

@@ -1,0 +1,935 @@
+KPI Post‑Discharge Follow‑up within 48 hours
+CCDA (Bronze):
+
+CCDA_ENCOUNTERS → encounter periods, codes. [onlinect-m...epoint.com]
+CCDA_PLAN_OF_CARE → discharge instructions / follow‑up plan items (proxy for discharge notification). [onlinect-m...epoint.com]
+CCDA_BRONZE → raw XML, if you want to backfill/validate. [onlinect-m...epoint.com]
+
+HL7 (Bronze):
+
+HL7_BRONZE_PV1 → patient class + ADMIT_DT_TZ/DISCHARGE_DT_TZ per visit (strong signal for discharge date/time). [onlinect-m...epoint.com]
+HL7_BRONZE_EVN → EVENT_TYPE_CODE (A03 discharge) with EVENT_OCCURRED_TZ (use as discharge “notification” when present). [onlinect-m...epoint.com]
+HL7_BRONZE_PID → patient identifiers to tie EVN/PV1 to a patient. [onlinect-m...epoint.com]
+MAP_PATIENT_ID (HL7 + SILVER) → cross‑system MPI mapping to unify HL7/CSV IDs. [onlinect-m...epoint.com]
+
+CSV (Bronze):
+
+ENCOUNTERS → in/outpatient visits with start/stop and payer/organization. [onlinect-m...epoint.com]
+CAREPLANS → follow‑up plans (use as proxy “contact” when description/reason indicates outreach/call/appointment). [onlinect-m...epoint.com]
+PATIENTS, PROVIDERS, ORGANIZATIONS → dims for slicing (provider/facility). [onlinect-m...epoint.com]
+
+
+Per your KPI sheet, the metric is:
+% Post‑Discharge Follow‑up within 48 hours of the discharge notification (exclude those re‑admitted within 2 business days)
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID (
+  MPI_ID            varchar not null,      -- Master Patient Index (deterministic hash)
+  HL7_PATIENT_ID    varchar,               -- best HL7 ID (PID_BEST_V.id_number)
+  CSV_PATIENT_ID    varchar,               -- CSV.PATIENTS.ID
+  CCDA_PATIENT_ID   varchar,               -- CCDA PATIENT_ID (from CCDA_ENCOUNTERS etc.)
+  FIRST_NAME        varchar,               -- preferred (CSV, else HL7)
+  LAST_NAME         varchar,
+  DOB               date,
+  SEX               varchar,
+  CITY              varchar,
+  STATE             varchar,
+  SOURCE_PRIORITY   varchar,               -- e.g., 'CSV>HL7>CCDA'
+  CREATED_AT        timestamp_ntz default current_timestamp(),
+  UPDATED_AT        timestamp_ntz default current_timestamp()
+);
+
+create or replace sequence CCDA_FINAL_ASSIGNMENT.SILVER.MPI_SEQ start = 1 increment = 1;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+use database HL7_FINAL_ASSIGNMENT;
+use schema HL7;
+
+-- 1) HL7_BRONZE_BASE_V
+create or replace view HL7_BRONZE_BASE_V(
+  FILENAME, FILE_ROW_NUMBER, SEGMENT_TYPE, LINE, MESSAGE_ID, PROCESS_TS
+) as
+select
+  FILENAME,
+  FILE_ROW_NUMBER,
+  SEGMENT_TYPE,
+  LINE,
+  last_value(
+    case when SEGMENT_TYPE = 'MSH' then split_part(LINE, '\n', 10) end
+  ) ignore nulls over (
+    partition by FILENAME
+    order by FILE_ROW_NUMBER
+    rows between unbounded preceding and current row
+  ) as MESSAGE_ID,
+  current_timestamp() as PROCESS_TS
+from HL7_BRONZE_RAW;
+
+-- 2) PID_ID_LIST_V
+create or replace view PID_ID_LIST_V(MESSAGE_ID, PATIENT_ID_LIST) as
+select MESSAGE_ID, split_part(LINE,'\n',4) as PATIENT_ID_LIST
+from HL7_BRONZE_BASE_V
+where SEGMENT_TYPE='PID';
+
+-- 3) PID_ONE_V
+create or replace view PID_ONE_V(MESSAGE_ID, PATIENT_ID_LIST) as
+select *
+from PID_ID_LIST_V
+qualify row_number() over (partition by MESSAGE_ID order by MESSAGE_ID) = 1;
+
+-- 4) PID_IDS_V
+create or replace view PID_IDS_V(MESSAGE_ID, CX) as
+select p.MESSAGE_ID, f.value::string as cx
+from PID_ONE_V p, lateral flatten(input => split(p.PATIENT_ID_LIST,'~')) f;
+
+-- 5) PID_BEST_V (prefers MR/PI/RI; else best available)
+create or replace view PID_BEST_V(
+  MESSAGE_ID, ID_NUMBER, ASSIGNING_AUTHORITY, IDENTIFIER_TYPE_CODE, ASSIGNING_FACILITY
+) as
+select MESSAGE_ID,
+       split_part(cx,'^',1) as id_number,
+       split_part(cx,'^',4) as assigning_authority,
+       split_part(cx,'^',5) as identifier_type_code,
+       split_part(cx,'^',6) as assigning_facility
+from PID_IDS_V
+qualify row_number() over (
+  partition by MESSAGE_ID
+  order by case when identifier_type_code in ('MR','PI','RI') then 1 else 9 end,
+           nvl(assigning_authority,'') desc
+) = 1;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- -----------------------------------------------------------------------------------
+-- STEP 1: Build the rollup into a TEMP TABLE (so MERGE has a simple USING source)
+-- -----------------------------------------------------------------------------------
+create or replace temporary table CCDA_FINAL_ASSIGNMENT.SILVER._MAP_PROVIDER_ID_ROLLUP as
+with hl7_p as (
+  select distinct
+    coalesce(ATTENDING_ID, REFERRING_ID, CONSULTING_ID, ADMITTING_ID) as HL7_PROVIDER_ID,
+    upper(coalesce(ATTENDING_FIRST_NAME, REFERRING_FIRST_NAME, CONSULTING_FIRST_NAME, ADMITTING_FIRST_NAME)) as FIRST_NAME,
+    upper(coalesce(ATTENDING_LAST_NAME,  REFERRING_LAST_NAME,  CONSULTING_LAST_NAME,  ADMITTING_LAST_NAME))  as LAST_NAME,
+    LOC_FACILITY as ORG_ID
+  from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1
+  where coalesce(ATTENDING_ID, REFERRING_ID, CONSULTING_ID, ADMITTING_ID) is not null
+),
+csv_p as (
+  select
+    ID as CSV_PROVIDER_ID,
+    upper(NAME) as NAME,
+    ORGANIZATION as ORG_ID
+  from CSV_FINAL_ASSIGNMENT.CSV.PROVIDERS
+),
+stg as (
+  select
+    'HL7' as src,
+    HL7_PROVIDER_ID as pid,
+    /* Safe concatenation for display name */
+    trim(
+      case
+        when LAST_NAME is not null and FIRST_NAME is not null
+          then nvl(LAST_NAME,'') || ', ' || nvl(FIRST_NAME,'')
+        else nvl(FIRST_NAME, nvl(LAST_NAME,''))
+      end
+    ) as NAME,
+    ORG_ID,
+    /* Deterministic grouping key without nulls */
+    md5(nvl(LAST_NAME,'') || '|' || nvl(FIRST_NAME,'') || '|' || nvl(ORG_ID,'')) as gkey
+  from hl7_p
+
+  union all
+
+  select
+    'CSV' as src,
+    CSV_PROVIDER_ID as pid,
+    NAME,
+    ORG_ID,
+    md5(nvl(NAME,'') || '|' || nvl(ORG_ID,'')) as gkey
+  from csv_p
+)
+select
+  md5('PROV:' || gkey) as MPI_PROVIDER_ID,
+  max(iff(src='HL7', pid, null)) as HL7_PROVIDER_ID,
+  max(iff(src='CSV', pid, null)) as CSV_PROVIDER_ID,
+  max(NAME)                     as PROVIDER_NAME,
+  max(ORG_ID)                   as ORGANIZATION_ID,
+  case
+    when max(iff(src='CSV', 1, 0)) = 1 and max(iff(src='HL7', 1, 0)) = 1 then 'CSV>HL7'
+    when max(iff(src='CSV', 1, 0)) = 1 then 'CSV'
+    else 'HL7'
+  end as SOURCE_PRIORITY
+from stg
+group by gkey
+;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- -----------------------------------------------------------------------------------
+-- STEP 1: Build the rollup into a TEMP TABLE (so MERGE has a simple USING source)
+-- -----------------------------------------------------------------------------------
+create or replace temporary table CCDA_FINAL_ASSIGNMENT.SILVER._MAP_PROVIDER_ID_ROLLUP as
+with hl7_p as (
+  select distinct
+    coalesce(ATTENDING_ID, REFERRING_ID, CONSULTING_ID, ADMITTING_ID) as HL7_PROVIDER_ID,
+    upper(coalesce(ATTENDING_FIRST_NAME, REFERRING_FIRST_NAME, CONSULTING_FIRST_NAME, ADMITTING_FIRST_NAME)) as FIRST_NAME,
+    upper(coalesce(ATTENDING_LAST_NAME,  REFERRING_LAST_NAME,  CONSULTING_LAST_NAME,  ADMITTING_LAST_NAME))  as LAST_NAME,
+    LOC_FACILITY as ORG_ID
+  from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1
+  where coalesce(ATTENDING_ID, REFERRING_ID, CONSULTING_ID, ADMITTING_ID) is not null
+),
+csv_p as (
+  select
+    ID as CSV_PROVIDER_ID,
+    upper(NAME) as NAME,
+    ORGANIZATION as ORG_ID
+  from CSV_FINAL_ASSIGNMENT.CSV.PROVIDERS
+),
+stg as (
+  select
+    'HL7' as src,
+    HL7_PROVIDER_ID as pid,
+    /* Safe concatenation for display name */
+    trim(
+      case
+        when LAST_NAME is not null and FIRST_NAME is not null
+          then nvl(LAST_NAME,'') || ', ' || nvl(FIRST_NAME,'')
+        else nvl(FIRST_NAME, nvl(LAST_NAME,''))
+      end
+    ) as NAME,
+    ORG_ID,
+    /* Deterministic grouping key without nulls */
+    md5(nvl(LAST_NAME,'') || '|' || nvl(FIRST_NAME,'') || '|' || nvl(ORG_ID,'')) as gkey
+  from hl7_p
+
+  union all
+
+  select
+    'CSV' as src,
+    CSV_PROVIDER_ID as pid,
+    NAME,
+    ORG_ID,
+    md5(nvl(NAME,'') || '|' || nvl(ORG_ID,'')) as gkey
+  from csv_p
+)
+select
+  md5('PROV:' || gkey) as MPI_PROVIDER_ID,
+  max(iff(src='HL7', pid, null)) as HL7_PROVIDER_ID,
+  max(iff(src='CSV', pid, null)) as CSV_PROVIDER_ID,
+  max(NAME)                     as PROVIDER_NAME,
+  max(ORG_ID)                   as ORGANIZATION_ID,
+  case
+    when max(iff(src='CSV', 1, 0)) = 1 and max(iff(src='HL7', 1, 0)) = 1 then 'CSV>HL7'
+    when max(iff(src='CSV', 1, 0)) = 1 then 'CSV'
+    else 'HL7'
+  end as SOURCE_PRIORITY
+from stg
+group by gkey
+;
+
+
+
+-- -----------------------------------------------------------------------------------
+-- STEP 2: MERGE from the temp table into the target mapping table
+-- -----------------------------------------------------------------------------------
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PROVIDER_ID (
+  MPI_PROVIDER_ID   varchar not null,
+  HL7_PROVIDER_ID   varchar,
+  CSV_PROVIDER_ID   varchar,
+  PROVIDER_NAME     varchar,
+  ORGANIZATION_ID   varchar,
+  SOURCE_PRIORITY   varchar,
+  CREATED_AT        timestamp_ntz default current_timestamp(),
+  UPDATED_AT        timestamp_ntz default current_timestamp()
+);
+
+merge into CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PROVIDER_ID d
+using CCDA_FINAL_ASSIGNMENT.SILVER._MAP_PROVIDER_ID_ROLLUP s
+  on d.MPI_PROVIDER_ID = s.MPI_PROVIDER_ID
+when matched then update set
+  HL7_PROVIDER_ID = s.HL7_PROVIDER_ID,
+  CSV_PROVIDER_ID = s.CSV_PROVIDER_ID,
+  PROVIDER_NAME   = s.PROVIDER_NAME,
+  ORGANIZATION_ID = s.ORGANIZATION_ID,
+  SOURCE_PRIORITY = s.SOURCE_PRIORITY,
+  UPDATED_AT      = current_timestamp()
+when not matched then insert (
+  MPI_PROVIDER_ID, HL7_PROVIDER_ID, CSV_PROVIDER_ID, PROVIDER_NAME, ORGANIZATION_ID, SOURCE_PRIORITY
+) values (
+  s.MPI_PROVIDER_ID, s.HL7_PROVIDER_ID, s.CSV_PROVIDER_ID, s.PROVIDER_NAME, s.ORGANIZATION_ID, s.SOURCE_PRIORITY
+);
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+-- 3.2 MAP_FACILITY_ID
+
+-- HL7: Facility in HL7_BRONZE_PV1.LOC_FACILITY (plus LOC_DESCRIPTION, LOC_BUILDING, LOC_FLOOR). [onlinect-m...epoint.com]
+-- CSV: Facilities in CSV.ORGANIZATIONS (ID, NAME, CITY, STATE)
+
+
+
+
+-- -----------------------------------------------------------------------------------
+-- STEP 1: Build the rollup into a TEMP TABLE (so MERGE has a simple USING source)
+-- -----------------------------------------------------------------------------------
+create or replace temporary table CCDA_FINAL_ASSIGNMENT.SILVER._MAP_FACILITY_ID_ROLLUP as
+with hl7_f as (
+  select distinct
+    LOC_FACILITY                  as HL7_FACILITY_ID,
+    upper(nvl(LOC_DESCRIPTION,'')) as FACILITY_NAME,
+    /* HL7 PV1 does not carry CITY/STATE in your bronze schema, set to NULL */
+    null                          as CITY,
+    null                          as STATE
+  from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1
+  where LOC_FACILITY is not null
+),
+csv_f as (
+  select
+    ID               as CSV_FACILITY_ID,
+    upper(nvl(NAME,'')) as FACILITY_NAME,
+    upper(nvl(CITY,'')) as CITY,
+    upper(nvl(STATE,'')) as STATE
+  from CSV_FINAL_ASSIGNMENT.CSV.ORGANIZATIONS
+),
+stg as (
+  select
+    'HL7' as src,
+    HL7_FACILITY_ID as fid,
+    FACILITY_NAME, CITY, STATE,
+    md5(nvl(FACILITY_NAME,'')) as gkey
+  from hl7_f
+
+  union all
+
+  select
+    'CSV' as src,
+    CSV_FACILITY_ID as fid,
+    FACILITY_NAME, CITY, STATE,
+    md5(nvl(FACILITY_NAME,'')) as gkey
+  from csv_f
+)
+select
+  md5('FAC:' || gkey)                            as MPI_FACILITY_ID,
+  max(iff(src='HL7', fid, null))                 as HL7_FACILITY_ID,
+  max(iff(src='CSV', fid, null))                 as CSV_FACILITY_ID,
+  max(FACILITY_NAME)                             as FACILITY_NAME,
+  max(CITY)                                      as CITY,
+  max(STATE)                                     as STATE,
+  case
+    when max(iff(src='CSV', 1, 0)) = 1 and max(iff(src='HL7', 1, 0)) = 1 then 'CSV>HL7'
+    when max(iff(src='CSV', 1, 0)) = 1 then 'CSV'
+    else 'HL7'
+  end                                            as SOURCE_PRIORITY
+from stg
+group by gkey
+;
+
+
+-- -----------------------------------------------------------------------------------
+-- STEP 2: MERGE from the temp table into the target mapping table
+-- -----------------------------------------------------------------------------------
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.MAP_FACILITY_ID (
+  MPI_FACILITY_ID   varchar not null,
+  HL7_FACILITY_ID   varchar,
+  CSV_FACILITY_ID   varchar,
+  FACILITY_NAME     varchar,
+  CITY              varchar,
+  STATE             varchar,
+  SOURCE_PRIORITY   varchar,
+  CREATED_AT        timestamp_ntz default current_timestamp(),
+  UPDATED_AT        timestamp_ntz default current_timestamp()
+);
+
+merge into CCDA_FINAL_ASSIGNMENT.SILVER.MAP_FACILITY_ID d
+using CCDA_FINAL_ASSIGNMENT.SILVER._MAP_FACILITY_ID_ROLLUP s
+  on d.MPI_FACILITY_ID = s.MPI_FACILITY_ID
+when matched then update set
+  HL7_FACILITY_ID = s.HL7_FACILITY_ID,
+  CSV_FACILITY_ID = s.CSV_FACILITY_ID,
+  FACILITY_NAME   = s.FACILITY_NAME,
+  CITY            = s.CITY,
+  STATE           = s.STATE,
+  SOURCE_PRIORITY = s.SOURCE_PRIORITY,
+  UPDATED_AT      = current_timestamp()
+when not matched then insert (
+  MPI_FACILITY_ID, HL7_FACILITY_ID, CSV_FACILITY_ID, FACILITY_NAME, CITY, STATE, SOURCE_PRIORITY
+) values (
+  s.MPI_FACILITY_ID, s.HL7_FACILITY_ID, s.CSV_FACILITY_ID, s.FACILITY_NAME, s.CITY, s.STATE, s.SOURCE_PRIORITY
+);
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+-- 3.3 MAP_PAYER_ID
+
+-- HL7 Insurance: HL7_BRONZE_IN1 (e.g., PLAN_ID_CODE, COMPANY_ID_CODE, COMPANY_NAME) [onlinect-m...epoint.com]
+-- CSV Payers: CSV.PAYERS (ID, NAME)
+
+
+
+
+-- ------------------------------------------------------------------------------
+-- STEP 1: Build the rollup into a TEMP TABLE (so MERGE has a simple USING source)
+-- ------------------------------------------------------------------------------
+create or replace temporary table CCDA_FINAL_ASSIGNMENT.SILVER._MAP_PAYER_ID_ROLLUP as
+with hl7_payer as (
+  select distinct
+    coalesce(PLAN_ID_CODE, COMPANY_ID_CODE)         as HL7_PAYER_ID,
+    upper(coalesce(PLAN_ID_DESC, COMPANY_NAME, '')) as PAYER_NAME
+  from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_IN1
+  where coalesce(PLAN_ID_CODE, COMPANY_ID_CODE) is not null
+),
+csv_payer as (
+  select
+    ID               as CSV_PAYER_ID,
+    upper(nvl(NAME,'')) as PAYER_NAME
+  from CSV_FINAL_ASSIGNMENT.CSV.PAYERS
+),
+stg as (
+  select
+    'HL7' as src,
+    HL7_PAYER_ID as pid,
+    PAYER_NAME,
+    md5(nvl(PAYER_NAME,'')) as gkey
+  from hl7_payer
+
+  union all
+
+  select
+    'CSV' as src,
+    CSV_PAYER_ID as pid,
+    PAYER_NAME,
+    md5(nvl(PAYER_NAME,'')) as gkey
+  from csv_payer
+)
+select
+  md5('PAY:' || gkey)                    as MPI_PAYER_ID,
+  max(iff(src='HL7', pid, null))         as HL7_PAYER_ID,
+  max(iff(src='CSV', pid, null))         as CSV_PAYER_ID,
+  max(PAYER_NAME)                        as PAYER_NAME,
+  case
+    when max(iff(src='CSV', 1, 0)) = 1 and max(iff(src='HL7', 1, 0)) = 1 then 'CSV>HL7'
+    when max(iff(src='CSV', 1, 0)) = 1 then 'CSV'
+    else 'HL7'
+  end                                    as SOURCE_PRIORITY
+from stg
+group by gkey
+;
+
+
+
+-- ------------------------------------------------------------------------------
+-- STEP 2: MERGE from the temp table into the target mapping table
+-- ------------------------------------------------------------------------------
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PAYER_ID (
+  MPI_PAYER_ID      varchar not null,
+  HL7_PAYER_ID      varchar,
+  CSV_PAYER_ID      varchar,
+  PAYER_NAME        varchar,
+  SOURCE_PRIORITY   varchar,
+  CREATED_AT        timestamp_ntz default current_timestamp(),
+  UPDATED_AT        timestamp_ntz default current_timestamp()
+);
+
+merge into CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PAYER_ID d
+using CCDA_FINAL_ASSIGNMENT.SILVER._MAP_PAYER_ID_ROLLUP s
+  on d.MPI_PAYER_ID = s.MPI_PAYER_ID
+when matched then update set
+  HL7_PAYER_ID    = s.HL7_PAYER_ID,
+  CSV_PAYER_ID    = s.CSV_PAYER_ID,
+  PAYER_NAME      = s.PAYER_NAME,
+  SOURCE_PRIORITY = s.SOURCE_PRIORITY,
+  UPDATED_AT      = current_timestamp()
+when not matched then insert (
+  MPI_PAYER_ID, HL7_PAYER_ID, CSV_PAYER_ID, PAYER_NAME, SOURCE_PRIORITY
+) values (
+  s.MPI_PAYER_ID, s.HL7_PAYER_ID, s.CSV_PAYER_ID, s.PAYER_NAME, s.SOURCE_PRIORITY
+);
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- 1.1 Patients (unified IDs via MPI)
+
+
+-- SILVER.PATIENT_DIM
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.PATIENT_DIM (
+  MPI_ID          varchar,
+  HL7_PATIENT_ID  varchar,
+  CSV_PATIENT_ID  varchar,
+  FIRST_NAME      varchar,
+  LAST_NAME       varchar,
+  DOB             date,
+  SEX             varchar,
+  CITY            varchar,
+  STATE           varchar
+);
+
+-- Initial load (example: prefer CSV demographics, join to HL7 via MAP_PATIENT_ID)
+merge into CCDA_FINAL_ASSIGNMENT.SILVER.PATIENT_DIM d
+using (
+  select m.MPI_ID,
+         m.HL7_PATIENT_ID,
+         m.CSV_PATIENT_ID,
+         p.FIRST as FIRST_NAME, p.LAST as LAST_NAME,
+         try_to_date(p.BIRTHDATE) as DOB,
+         p.GENDER as SEX,
+         p.CITY, p.STATE
+  from CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  left join CSV_FINAL_ASSIGNMENT.CSV.PATIENTS p
+    on p.ID = m.CSV_PATIENT_ID
+) s
+on d.MPI_ID = s.MPI_ID
+when matched then update set
+  HL7_PATIENT_ID = s.HL7_PATIENT_ID,
+  CSV_PATIENT_ID = s.CSV_PATIENT_ID,
+  FIRST_NAME = s.FIRST_NAME,
+  LAST_NAME = s.LAST_NAME,
+  DOB = s.DOB,
+  SEX = s.SEX,
+  CITY = s.CITY,
+  STATE = s.STATE
+when not matched then insert values (
+  s.MPI_ID, s.HL7_PATIENT_ID, s.CSV_PATIENT_ID,
+  s.FIRST_NAME, s.LAST_NAME, s.DOB, s.SEX, s.CITY, s.STATE
+);
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- 1.2 Encounters (admit/discharge)
+
+
+-- -- SILVER.ENCOUNTER_UNION
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION (
+  MPI_ID         varchar,
+  ENCOUNTER_ID   varchar,
+  SOURCE_SYSTEM  varchar,
+  ENCOUNTER_CLASS varchar,
+  ADMIT_TS       timestamp_tz,
+  DISCHARGE_TS   timestamp_tz,
+  FACILITY_ID    varchar,
+  PROVIDER_ID    varchar,
+  PAYER_ID       varchar
+);
+
+-- HL7 source (PV1) – strong timestamps
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+select m.MPI_ID,
+       pv1.VISIT_NUMBER as ENCOUNTER_ID,
+       'HL7' as SOURCE_SYSTEM,
+       pv1.PATIENT_CLASS as ENCOUNTER_CLASS,
+       pv1.ADMIT_DT_TZ   as ADMIT_TS,
+       pv1.DISCHARGE_DT_TZ as DISCHARGE_TS,
+       pv1.LOC_FACILITY  as FACILITY_ID,
+       pv1.ATTENDING_ID  as PROVIDER_ID,
+       null as PAYER_ID
+from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1 pv1
+left join HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+  on pv1.MESSAGE_ID = pid.MESSAGE_ID
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.HL7_PATIENT_ID = pid.PATIENT_ID_LIST;
+
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+-- CCDA source (Encounters) – ISO times
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+select coalesce(m.MPI_ID, ccda.PATIENT_ID) as MPI_ID,
+       ccda.CODE || ':' || ccda.START_ISO::string as ENCOUNTER_ID,
+       'CCDA' as SOURCE_SYSTEM,
+       null    as ENCOUNTER_CLASS,
+       ccda.START_ISO::timestamp_tz as ADMIT_TS,
+       ccda.STOP_ISO::timestamp_tz  as DISCHARGE_TS,
+       null as FACILITY_ID, null as PROVIDER_ID, null as PAYER_ID
+from CCDA_FINAL_ASSIGNMENT.CCDA.CCDA_ENCOUNTERS ccda
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.CSV_PATIENT_ID = ccda.PATIENT_ID;
+  
+  (Uses CCDA_ENCOUNTERS, MAP_PATIENT_ID)
+-----------------------------------------------------------------------------------------------------------------------------------------------
+
+
+-- CSV source (Encounters)
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+select coalesce(m.MPI_ID, e.PATIENT) as MPI_ID,
+       e.ID as ENCOUNTER_ID,
+       'CSV' as SOURCE_SYSTEM,
+       e.ENCOUNTERCLASS,
+       try_to_timestamp_tz(e."START") as ADMIT_TS,
+       try_to_timestamp_tz(e.STOP)    as DISCHARGE_TS,
+       e.ORGANIZATION as FACILITY_ID,
+       e.PROVIDER     as PROVIDER_ID,
+       e.PAYER        as PAYER_ID
+from CSV_FINAL_ASSIGNMENT.CSV.ENCOUNTERS e
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.CSV_PATIENT_ID = e.PATIENT;
+-- -- (Uses CSV.ENCOUNTERS, MAP_PATIENT_ID) [onlinect-m...epoint.com]
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.3 Discharge notifications (from HL7 EVN “A03” + CCDA Plan of Care)
+
+
+-- SILVER.DISCHARGE_NOTIFICATIONS
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.DISCHARGE_NOTIFICATIONS (
+  MPI_ID            varchar,
+  ENCOUNTER_ID      varchar,
+  NOTIF_TS          timestamp_tz,
+  SOURCE_SYSTEM     varchar,
+  NOTIF_TYPE        varchar  -- e.g., 'HL7_A03', 'CCDA_DISCHARGE_INST'
+);
+
+-- HL7 EVN (A03 = discharge)
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.DISCHARGE_NOTIFICATIONS
+select m.MPI_ID,
+       pv1.VISIT_NUMBER as ENCOUNTER_ID,
+       evn.EVENT_OCCURRED_TZ as NOTIF_TS,
+       'HL7' as SOURCE_SYSTEM,
+       'HL7_A03' as NOTIF_TYPE,
+
+from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_EVN evn
+join HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1 pv1
+  on pv1.MESSAGE_ID = evn.MESSAGE_ID
+left join HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+  on pid.MESSAGE_ID = evn.MESSAGE_ID
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.HL7_PATIENT_ID = pid.PATIENT_ID_LIST
+where evn.EVENT_TYPE_CODE like '%A03';
+
+-- (Uses HL7_BRONZE_EVN, HL7_BRONZE_PV1, HL7_BRONZE_PID, MAP_PATIENT_ID)
+
+
+
+-- CCDA Plan Of Care entries as discharge instructions (proxy notification)
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.DISCHARGE_NOTIFICATIONS
+SELECT COALESCE(m.MPI_ID, c.PATIENT_ID) AS MPI_ID,
+       c.CODE || ':' || c.START_ISO::string AS ENCOUNTER_ID,
+       c.START_ISO::timestamp_tz AS NOTIF_TS,
+       'CCDA' AS SOURCE_SYSTEM,
+       'CCDA_DISCHARGE_INST' AS NOTIF_TYPE
+FROM CCDA_FINAL_ASSIGNMENT.CCDA.CCDA_PLAN_OF_CARE c
+LEFT JOIN CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  ON m.CSV_PATIENT_ID = c.PATIENT_ID;
+
+-- (Uses CCDA_PLAN_OF_CARE, MAP_PATIENT_ID)
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+-- 1.4 Post‑discharge contacts (proxy from CSV CAREPLANS)
+
+
+-- SILVER.POST_DISCHARGE_CONTACTS
+create or replace table CCDA_FINAL_ASSIGNMENT.SILVER.POST_DISCHARGE_CONTACTS (
+  MPI_ID          varchar,
+  ENCOUNTER_ID    varchar,
+  CONTACT_TS      timestamp_tz,
+  CONTACT_TYPE    varchar,
+  SOURCE_SYSTEM   varchar
+);
+
+-- Use CSV.CAREPLANS as outreach proxy (phone call, follow-up appointment, nurse check)
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.POST_DISCHARGE_CONTACTS
+select coalesce(m.MPI_ID, cp.PATIENT) as MPI_ID,
+       cp.ENCOUNTER as ENCOUNTER_ID,
+       try_to_timestamp_tz(cp."START") as CONTACT_TS,
+       case
+         when regexp_like(upper(coalesce(cp.REASONDESCRIPTION, cp.DESCRIPTION)),
+                          'PHONE|CALL|OUTREACH|FOLLOW[- ]?UP|APPT') then 'FOLLOW_UP'
+         else 'OTHER'
+       end as CONTACT_TYPE,
+       'CSV' as SOURCE_SYSTEM
+from CSV_FINAL_ASSIGNMENT.CSV.CAREPLANS cp
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.CSV_PATIENT_ID = cp.PATIENT;
+--(Uses CSV.CAREPLANS, MAP_PATIENT_ID) 
+-------------------------------------------------------------------------------------------------------------------------------------------------
+2) Streams — change capture on Bronze
+
+We’ll create streams on source tables so Tasks can incrementally populate Silver.
+
+
+-- CCDA streams
+
+create or replace stream CCDA_FINAL_ASSIGNMENT.CCDA.STM_CCDA_PLAN on table CCDA_FINAL_ASSIGNMENT.CCDA.CCDA_PLAN_OF_CARE;
+CCDA_FINAL_ASSIGNMENT.CCDA.CCDA_ENCOUNTERS_STR
+CCDA_FINAL_ASSIGNMENT.CCDA.CCDA_RESULTS_STR
+
+-- HL7 streams
+
+HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1
+HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_EVN
+HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID
+
+-- CSV streams
+
+-- create or replace stream HL7_FINAL_ASSIGNMENT.HL7.STM_MAP_PATIENT_ID on table CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID;
+
+CSV_FINAL_ASSIGNMENT.CSV.ENCOUNTERS_STR
+CSV_FINAL_ASSIGNMENT.CSV.CAREPLANS_STR
+HL7_FINAL_ASSIGNMENT.HL7.STM_MAP_PATIENT_ID
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+3) Tasks — incremental upserts into Silver
+
+Run tasks on a small cadence (e.g., every 5 minutes) or chained after staging loads; point them to a compute warehouse.
+
+-- Task: upsert encounters from HL7/CCDA/CSV streams
+
+CREATE OR REPLACE TASK CCDA_FINAL_ASSIGNMENT.SILVER.TASK_UPSERT_ENCOUNTERS
+  WAREHOUSE = COMPUTE_WH
+  schedule = 'USING CRON 0 0 1 * * UTC'
+AS
+BEGIN
+  -- HL7 from stream
+  INSERT INTO CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+  SELECT
+    m.MPI_ID,
+    pv1.VISIT_NUMBER,
+    'HL7',
+    pv1.PATIENT_CLASS,
+    pv1.ADMIT_DT_TZ,
+    pv1.DISCHARGE_DT_TZ,
+    pv1.LOC_FACILITY,
+    pv1.ATTENDING_ID,
+    NULL
+  FROM HL7_FINAL_ASSIGNMENT.HL7.STM_HL7_PV1 pv1
+  LEFT JOIN HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+    ON pid.MESSAGE_ID = pv1.MESSAGE_ID
+  LEFT JOIN CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+    ON m.HL7_PATIENT_ID = pid.PATIENT_ID;
+
+  -- CCDA from stream
+  INSERT INTO CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+  SELECT
+    COALESCE(m.MPI_ID, ccda.PATIENT_ID),
+    ccda.CODE || ':' || ccda.START_ISO::STRING,
+    'CCDA',
+    NULL,
+    ccda.START_ISO::TIMESTAMP_TZ,
+    ccda.STOP_ISO::TIMESTAMP_TZ,
+    NULL, NULL, NULL
+  FROM CCDA_FINAL_ASSIGNMENT.CCDA.STM_CCDA_ENCOUNTERS ccda
+  LEFT JOIN CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+    ON m.CSV_PATIENT_ID = ccda.PATIENT_ID;
+
+  -- CSV from stream
+  INSERT INTO CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+  SELECT
+    COALESCE(m.MPI_ID, e.PATIENT),
+    e.ID,
+    'CSV',
+    e.ENCOUNTERCLASS,
+    TRY_TO_TIMESTAMP_TZ(e."START"),
+    TRY_TO_TIMESTAMP_TZ(e.STOP),
+    e.ORGANIZATION,
+    e.PROVIDER,
+    e.PAYER
+  FROM CSV_FINAL_ASSIGNMENT.CSV.STM_CSV_ENCOUNTERS e
+  LEFT JOIN CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+    ON m.CSV_PATIENT_ID = e.PATIENT;
+END;
+
+-- Tasks are created SUSPENDED; resume after creation
+-- ALTER TASK CCDA_FINAL_ASSIGNMENT.SILVER.TASK_UPSERT_ENCOUNTERS SUSPEND;
+
+
+-- (Uses HL7_BRONZE_PV1, HL7_BRONZE_PID, MAP_PATIENT_ID, CCDA_ENCOUNTERS, CSV.ENCOUNTERS)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Task: upsert discharge notifications from EVN + CCDA Plan
+
+-- HL7 A03 task
+create or replace task CCDA_FINAL_ASSIGNMENT.SILVER.TASK_DISCH_NOTIF_HL7
+  warehouse = COMPUTE_WH
+  schedule = 'USING CRON 0 0 1 * * UTC'
+as
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.DISCHARGE_NOTIFICATIONS
+select
+  m.MPI_ID,
+  pv1.VISIT_NUMBER as ENCOUNTER_ID,
+  evn.EVENT_OCCURRED_TZ as NOTIF_TS,
+  'HL7' as SOURCE_SYSTEM,
+  'HL7_A03' as NOTIF_TYPE
+from HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_EVN evn
+join HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PV1 pv1
+  on pv1.MESSAGE_ID = evn.MESSAGE_ID
+left join HL7_FINAL_ASSIGNMENT.HL7.HL7_BRONZE_PID pid
+  on pid.MESSAGE_ID = evn.MESSAGE_ID
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.HL7_PATIENT_ID = pid.PATIENT_ID_LIST
+where evn.EVENT_TYPE_CODE like '%A03';
+
+-- (Uses HL7_BRONZE_EVN, HL7_BRONZE_PV1, HL7_BRONZE_PID, CCDA_PLAN_OF_CARE, MAP_PATIENT_ID)
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Task: upsert post-discharge contacts from CAREPLANS proxy
+create or replace task CCDA_FINAL_ASSIGNMENT.SILVER.TASK_UPSERT_POST_CONTACT
+  warehouse = COMPUTE_WH
+  SCHEDULE = 'USING CRON 0 0 1 * * UTC'
+as
+insert into CCDA_FINAL_ASSIGNMENT.SILVER.POST_DISCHARGE_CONTACTS
+select coalesce(m.MPI_ID, cp.PATIENT) as MPI_ID,
+       cp.ENCOUNTER as ENCOUNTER_ID,
+       try_to_timestamp_tz(cp."START") as CONTACT_TS,
+       case
+         when regexp_like(upper(coalesce(cp.REASONDESCRIPTION, cp.DESCRIPTION)),
+                          'PHONE|CALL|OUTREACH|FOLLOW[- ]?UP|APPT') then 'FOLLOW_UP'
+         else 'OTHER'
+       end as CONTACT_TYPE,
+       'CSV' as SOURCE_SYSTEM
+from CSV_FINAL_ASSIGNMENT.CSV.CAREPLANS cp
+left join CCDA_FINAL_ASSIGNMENT.SILVER.MAP_PATIENT_ID m
+  on m.CSV_PATIENT_ID = cp.PATIENT;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+4) Gold layer — Dynamic Tables for Power BI
+We’ll build Dynamic Tables (auto‑refresh semantics) to compute the KPI end‑to‑end and publish clean fact tables for Power BI.
+
+
+-- 4.1 Base linkage (discharge → first contact)
+
+
+-- GOLD Dynamic Table: base link of discharge to first contact within 48 hours
+CREATE OR REPLACE DYNAMIC TABLE CCDA_FINAL_ASSIGNMENT.GOLD.DT_FOLLOWUP_BASE
+  TARGET_LAG = '720 HOURS'       -- 30 days ≈ 30 * 24 hours
+  WAREHOUSE  = COMPUTE_WH
+AS
+WITH disch AS (
+  SELECT MPI_ID, ENCOUNTER_ID, NOTIF_TS
+  FROM CCDA_FINAL_ASSIGNMENT.SILVER.DISCHARGE_NOTIFICATIONS
+),
+contacts AS (
+  SELECT MPI_ID, ENCOUNTER_ID, CONTACT_TS, CONTACT_TYPE
+  FROM CCDA_FINAL_ASSIGNMENT.SILVER.POST_DISCHARGE_CONTACTS
+)
+SELECT
+  d.MPI_ID,
+  d.ENCOUNTER_ID,
+  d.NOTIF_TS,
+  MIN(c.CONTACT_TS)                                    AS FIRST_CONTACT_TS,
+  MIN_BY(c.CONTACT_TYPE, c.CONTACT_TS)                AS FIRST_CONTACT_TYPE,   -- returns type for earliest contact
+  DATEDIFF('hour', d.NOTIF_TS, MIN(c.CONTACT_TS))     AS HOURS_TO_CONTACT
+FROM disch d
+LEFT JOIN contacts c
+ --  ON c.MPI_ID       = d.MPI_ID
+ -- AND c.ENCOUNTER_ID = d.ENCOUNTER_ID
+ on c.CONTACT_TS   >= d.NOTIF_TS
+GROUP BY d.MPI_ID, d.ENCOUNTER_ID, d.NOTIF_TS;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- 4.2 Readmission exclusion window (≤ 48 hours)
+
+
+-- GOLD Dynamic Table: readmission within 48h
+create or replace dynamic table CCDA_FINAL_ASSIGNMENT.GOLD.DT_READMIT_48H
+  target_lag = '720 HOURS'
+  warehouse = COMPUTE_WH
+as
+with enc as (
+  select MPI_ID, ENCOUNTER_ID, ADMIT_TS, DISCHARGE_TS
+  from CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+)
+select e1.MPI_ID, e1.ENCOUNTER_ID as PRIOR_ENC_ID, e1.DISCHARGE_TS,
+       e2.ENCOUNTER_ID as READMIT_ENC_ID, e2.ADMIT_TS
+from enc e1
+join enc e2
+  on e2.MPI_ID = e1.MPI_ID
+ and e2.ADMIT_TS > e1.DISCHARGE_TS
+ and datediff('hour', e1.DISCHARGE_TS, e2.ADMIT_TS) <= 48;
+
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+-- 4.3 KPI fact (flag within 48h, exclude readmits)
+
+
+-- GOLD Dynamic Table: KPI calculation per encounter
+create or replace dynamic table CCDA_FINAL_ASSIGNMENT.GOLD.DT_FOLLOWUP_KPI_ENC
+  target_lag = '720 HOURS'
+  warehouse = COMPUTE_WH
+as
+with base as (
+  select * from CCDA_FINAL_ASSIGNMENT.GOLD.DT_FOLLOWUP_BASE
+),
+rm as (
+  select MPI_ID, PRIOR_ENC_ID from CCDA_FINAL_ASSIGNMENT.GOLD.DT_READMIT_48H
+)
+select
+  b.MPI_ID,
+  b.ENCOUNTER_ID,
+  b.NOTIF_TS,
+  b.FIRST_CONTACT_TS,
+  b.FIRST_CONTACT_TYPE,
+  b.HOURS_TO_CONTACT,
+  case when b.FIRST_CONTACT_TS is not null and b.HOURS_TO_CONTACT <= 48 then 1 else 0 end as FOLLOWUP_48H_FLAG,
+  case when r.PRIOR_ENC_ID is not null then 1 else 0 end as READMIT_48H_FLAG
+from base b
+left join rm r
+  on r.MPI_ID = b.MPI_ID and r.PRIOR_ENC_ID = b.ENCOUNTER_ID;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- 4.4 KPI by month / provider / facility (Power BI–ready)
+
+
+-- GOLD Dynamic Table: aggregated KPI
+create or replace dynamic table CCDA_FINAL_ASSIGNMENT.GOLD.DT_FOLLOWUP_KPI_MONTHLY
+  target_lag = '720 HOURS'
+  warehouse = COMPUTE_WH
+as
+with k as (
+  select * from CCDA_FINAL_ASSIGNMENT.GOLD.DT_FOLLOWUP_KPI_ENC
+),
+enc as (
+  select ENCOUNTER_ID, PROVIDER_ID, FACILITY_ID, PAYER_ID
+  from CCDA_FINAL_ASSIGNMENT.SILVER.ENCOUNTER_UNION
+)
+select
+  date_trunc('month', k.NOTIF_TS) as KPI_MONTH,
+  enc.PROVIDER_ID,
+  enc.FACILITY_ID,
+  enc.PAYER_ID,
+  count(*) as DISCH_NOTIF_CNT,
+  sum(case when k.READMIT_48H_FLAG = 0 then 1 else 0 end) as ELIGIBLE_CNT,
+  sum(case when k.READMIT_48H_FLAG = 0 and k.FOLLOWUP_48H_FLAG = 1 then 1 else 0 end) as FOLLOWUP_48H_CNT,
+  iff(nullif(sum(case when k.READMIT_48H_FLAG = 0 then 1 else 0 end),0) is null,
+      null,
+      (sum(case when k.READMIT_48H_FLAG = 0 and k.FOLLOWUP_48H_FLAG = 1 then 1 else 0 end)
+       / nullif(sum(case when k.READMIT_48H_FLAG = 0 then 1 else 0 end),0)::float) * 100
+  ) as FOLLOWUP_48H_PCT
+from k
+left join enc
+  on enc.ENCOUNTER_ID = k.ENCOUNTER_ID
+group by 1,2,3,4;
+
+
+--Power BI can connect directly to these Dynamic Tables for near‑real‑time slices by month, provider, facility, payer.
+
+--Power BI can connect directly to these Dynamic Tables for near‑real‑time slices by month, provider, facility, payer.
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+
+-- Spot-check recent discharges and contact within 48h
+select *
+from CCDA_FINAL_ASSIGNMENT.SILVER.DT_FOLLOWUP_KPI_ENC
+where notif_ts >= dateadd('day', -30, current_timestamp())
+order by notiff_ts desc;
+
+-- Monthly KPI by facility/provider
+select *
+from CCDA_FINAL_ASSIGNMENT.SILVER.DT_FOLLOWUP_KPI_MONTHLY
+order by KPI_MONTH desc, FACILITY_ID, PROVIDER_ID;
+
+-------------------------------------------------------------------------------------------------------------------------------------------------
+If you want, I can:
+
+Deploy these objects in your Snowflake (including warehouse/task chaining),
+Add a working business‑day calendar option,
+Ship a Power BI pbix with: trend line, funnel (eligible vs contacted), heatmaps by provider/facility, and a drill‑through page.
+
+
+PUT file://C:/Users/38124/Downloads/ccda_parser.zip @CCDA_FINAL_ASSIGNMENT.CODE_STAGE AUTO_COMPRESS=FALSE;
+
