@@ -18,7 +18,7 @@ A production-ready, version-controlled repository for a Snowflake-based data pip
 ---
 
 ## 📁 Repo Structure
-```
+   
 snowflake-medallion-project/
 ├── KPIs/
 │   ├── GOLD_LAYER_READMISSION_KPI.ipynb
@@ -62,7 +62,7 @@ snowflake-medallion-project/
 │
 ├── README.md
 └── requirements.txt
-```
+   
 
 ## 🔐 Security & Secrets
 
@@ -88,33 +88,33 @@ S3_PREFIX=landing/
 ## 🚀 Quick Start
 
 ### 1) Clone & set up
-```bash
+   bash
 git clone https://github.com/<your-username>/<repo-name>.git
 cd <repo-name>
 python -m venv .venv
 source .venv/bin/activate  # Windows: .venv\\Scripts\\activate
 pip install -r requirements.txt
 cp config/sample.env .env   # Fill in your local secrets
-```
+   
 
 ### 2) Create Snowflake objects
-Run the DDL scripts in `sql/` using Snowflake Web UI or a client:
-```sql
+Run the DDL scripts in  sql/  using Snowflake Web UI or a client:
+   sql
 -- 00_init_database.sql
 CREATE DATABASE IF NOT EXISTS MEDALLION_DB;
 CREATE SCHEMA IF NOT EXISTS MEDALLION_DB.BRONZE;
 CREATE SCHEMA IF NOT EXISTS MEDALLION_DB.SILVER;
 CREATE SCHEMA IF NOT EXISTS MEDALLION_DB.GOLD;
-```
+   
 
 ### 3) Configure Stage & Snowpipe (S3 → Snowflake)
-Use `snowflake_client.py` or execute scripts that:
+Use  snowflake_client.py  or execute scripts that:
 - Create an **external stage** pointing to your S3 bucket.
 - Define a **file format** (e.g., JSON/CSV/Parquet).
-- Create **Snowpipe** with auto-ingest from S3 events (or run `COPY INTO`).
+- Create **Snowpipe** with auto-ingest from S3 events (or run  COPY INTO ).
 
 Example SQL (simplified):
-```sql
+   sql
 CREATE OR REPLACE FILE FORMAT ff_json TYPE = JSON;
 CREATE OR REPLACE STAGE s3_stage
   URL='s3://<bucket>/<prefix>'
@@ -161,8 +161,8 @@ CREATE OR REPLACE FILE FORMAT FF_RAW
 ---
 
 ## 🔗 Snowflake & S3 Connections (Python)
-Basic connectors used in `src/`:
-```python
+Basic connectors used in  src/ :
+   python
 # snowflake_client.py
 import os
 import snowflake.connector
@@ -179,31 +179,31 @@ conn = snowflake.connector.connect(
 
 
 ## 🧪 Testing
-- Use `pytest` for Python modules in `src/`.
+- Use  pytest  for Python modules in  src/ .
 - Add data quality checks for Silver (nulls, types, duplicates).
-- Include sample test data in `/tests/data/` (non-sensitive).
+- Include sample test data in  /tests/data/  (non-sensitive).
 
 ---
 
 ## 📦 Requirements
-Minimal `requirements.txt`:
-```
+Minimal  requirements.txt :
+   
 snowflake-connector-python
 boto3
 python-dotenv
 pandas
 snowflake
 pytest
-```
+   
 
 ---
 
 ## 🛡️ Best Practices
-- Keep **DDL/DML** versioned under `sql/`.
-- Treat notebooks as **reproducible experiments**; production logic belongs in `src/`.
+- Keep **DDL/DML** versioned under  sql/ .
+- Treat notebooks as **reproducible experiments**; production logic belongs in  src/ .
 - Use **roles/least privilege** in Snowflake and **IAM roles** in AWS.
 - Prefer **external stages** + **Snowpipe** for scalable ingestion; 
-  fall back to scheduled `COPY INTO` for simpler setups.
+  fall back to scheduled  COPY INTO  for simpler setups.
 - Store PII securely; consider masking policies and row access policies.
 
 ---
