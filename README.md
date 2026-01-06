@@ -18,31 +18,44 @@ A production-ready, version-controlled repository for a Snowflake-based data pip
 ---
 
 ## 📁 Repo Structure
-```
-snowflake-project/
-├── notebooks/                # Jupyter notebooks (.ipynb)
-│   ├── 01_ingest_bronze.ipynb
-│   ├── 02_transform_silver.ipynb
-│   ├── 03_publish_gold.ipynb
-│   └── utils_demo.ipynb
-├── sql/                      # SQL scripts (DDL/DML)
-│   ├── 00_init_database.sql
-│   ├── 10_bronze_objects.sql
-│   ├── 20_silver_objects.sql
-│   ├── 30_gold_objects.sql
-│   └── 99_teardown.sql
-├── src/                      # Python modules/utilities
-│   ├── s3_client.py
-│   ├── snowflake_client.py
-│   ├── snowpipe_utils.py
-│   └── transforms/
-├── tests/                    # Unit tests
-├── README.md                 # Project documentation
-├── requirements.txt          # Python dependencies
-└── .gitignore                # Ignore notebooks caches & secrets
-```
-
----
+snowflake-medallion-project/
+├── KPIs/
+│   ├── GOLD_LAYER_READMISSION_KPI.ipynb
+│   ├── SILVER_LAYER_READMISSION_KPI.ipynb
+│   ├── KPI Post‑Discharge Follow‑up within 48 hours.txt
+│   ├── KPI explanation Post‑Discharge Follow‑up within 48 hours.txt
+│   ├── Medication Errors per 100 patients GOLD LAYER TABLES.txt
+│   ├── Medication Errors per 100 patients Silver layer views.txt
+│   ├── RAW_AND_BRONZE_LAYERS_OF_CSV.sql
+│   ├── CCDA_FINAL_ASSIGNMENT.sql
+│   └── text.txt
+│
+├── SQL/
+│   ├── final database.sql│   
+│   │
+│   ├── CCDA/
+│   │   ├── ccda.zip
+│   │   ├── ccdaparser.py
+│   │   └── CCDA_PARSER Master.ipynb
+│   │   └── test.sql
+│   │
+│   ├── CSV/
+│   │   ├── CSV.txt
+│   │   ├── CSV_PARSER.sql  
+│   │   └── csv_1.zip   
+│   │
+│   ├── HL7/
+│   │   ├── HL7.txt
+│   │   ├── HL7_ADT_1_300.zip
+│   │   ├── HL7_ORM_1_100.zip
+│   │   └── HL7_ORU_1_100.zip
+│
+├── notebooks/
+│   ├── CCDA_PARSER Master
+│   └── Post Discharge Follow up within 48 hours of the discharge notification.ipynb
+│
+├── README.md
+└── requirements.txt
 
 ## 🔐 Security & Secrets
 
