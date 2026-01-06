@@ -26,32 +26,32 @@ snowflake-medallion-project/
 │   ├── KPI explanation Post‑Discharge Follow‑up within 48 hours.txt
 │   ├── Medication Errors per 100 patients GOLD LAYER TABLES.txt
 │   ├── Medication Errors per 100 patients Silver layer views.txt
-│   ├── RAW_AND_BRONZE_LAYERS_OF_CSV.sql
-│   ├── CCDA_FINAL_ASSIGNMENT.sql
 │   └── text.txt
 │
 ├── SQL/
-│   ├── final database.sql│   
+│   ├── final database.sql
+│   ├── RAW_AND_BRONZE_LAYERS_OF_CSV.sql
+│   ├── CCDA_FINAL_ASSIGNMENT.sql
+│   ├── CSV_PARSER.sql
+│   ├── test.sql
 │   │
 │   ├── CCDA/
 │   │   ├── ccda.zip
 │   │   ├── ccdaparser.py
 │   │   └── CCDA_PARSER Master.ipynb
-│   │   └── test.sql
 │   │
 │   ├── CSV/
 │   │   ├── CSV.txt
-│   │   ├── CSV_PARSER.sql  
-│   │   └── csv_1.zip   
+│   │   └── csv_1.zip
 │   │
 │   ├── HL7/
-│   │   ├── HL7.txt
-│   │   ├── HL7_ADT_1_300.zip
-│   │   ├── HL7_ORM_1_100.zip
-│   │   └── HL7_ORU_1_100.zip
+│       ├── HL7.txt
+│       ├── HL7_ADT_1_300.zip
+│       ├── HL7_ORM_1_100.zip
+│       └── HL7_ORU_1_100.zip
 │
 ├── notebooks/
-│   ├── CCDA_PARSER Master
+│   ├── CCDA_PARSER Master.ipynb
 │   └── Post Discharge Follow up within 48 hours of the discharge notification.ipynb
 │
 ├── README.md
