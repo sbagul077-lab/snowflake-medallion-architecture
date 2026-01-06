@@ -130,7 +130,20 @@ CREATE OR REPLACE FILE FORMAT HL7_BRONZE_FF
 
 #CSV File Format
 > Prefer IAM role-based auth or Snowflake external stages with AWS integration for production.
-
+CREATE OR REPLACE FILE FORMAT FF_CSV
+  TYPE = CSV
+  FIELD_DELIMITER = ','
+  SKIP_HEADER = 1
+  FIELD_OPTIONALLY_ENCLOSED_BY = '"'
+  TRIM_SPACE = TRUE
+  EMPTY_FIELD_AS_NULL = TRUE
+  NULL_IF = ('NULL');
+ 
+CREATE OR REPLACE FILE FORMAT FF_RAW
+  TYPE = CSV
+  FIELD_DELIMITER = '\t'       -- entire line goes into one column
+  SKIP_HEADER = 0              -- keep header if you want it
+  FIELD_OPTIONALLY_ENCLOSED_BY = NONE;
 ---
 
 ## 🧱 Medallion Layers
