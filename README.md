@@ -19,6 +19,7 @@ A production-ready, version-controlled repository for a Snowflake-based data pip
 
 ## 📁 Repo Structure
 snowflake-medallion-project/
+snowflake-medallion-project/
 ├── KPIs/
 │   ├── GOLD_LAYER_READMISSION_KPI.ipynb
 │   ├── SILVER_LAYER_READMISSION_KPI.ipynb
