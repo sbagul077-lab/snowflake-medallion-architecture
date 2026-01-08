@@ -35,6 +35,7 @@ snowflake-medallion-project/
 ├── Power BI/
 │   ├── Patient Analysis_Dashboard
 │   ├── Patient_Analytics 1.pbix
+│   ├── ER Diagram.png
 │   └── readme.md    
 ├── SQL/
 │   ├── final database.sql
