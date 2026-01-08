@@ -32,7 +32,10 @@ snowflake-medallion-project/
 │   ├── Medication Errors per 100 patients GOLD LAYER TABLES.txt
 │   ├── Medication Errors per 100 patients Silver layer views.txt
 │   └── text.txt
-│
+├── Power BI/
+│   ├── Patient Analysis_Dashboard
+│   ├── Patient_Analytics 1.pbix
+│   └── readme.md    
 ├── SQL/
 │   ├── final database.sql
 │   ├── RAW_AND_BRONZE_LAYERS_OF_CSV.sql
